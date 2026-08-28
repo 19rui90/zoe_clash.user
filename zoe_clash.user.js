@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ZOE - Clash Screenshot
 // @namespace    https://www.managerzone.com/
-// @version      1.2.6.1
+// @version      1.2.6.3
 // @description  Gera imagens do Clash Matcher com upload e guestbook
 // @author       ruisimoes
 // @license      MIT
@@ -13,13 +13,17 @@
 // @grant        GM_xmlhttpRequest
 // @require      https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js
 // @connect      greasefork.org
+// @connect      statsxente.com
 // @connect      script.google.com
+// @connect      script.googleusercontent.com
+// @connect      api.github.com
+// @connect      raw.githubusercontent.com
+// @connect      ibb.co
+// @connect      api.imgbb.com
 // @connect      ouo.io
 // @connect      ouo.press
-// @connect      api.imgbb.com
-// @connect      raw.githubusercontent.com
-// @updateURL   https://update.greasefork.org/scripts/588299/ZOE-Clash-Screenshot.meta.js
-// @downloadURL https://update.greasefork.org/scripts/588299/ZOE-Clash-Screenshot.user.js
+// @updateURL   https://raw.githubusercontent.com/19rui90/zoe_clash.user/main/zoe_clash.user.js
+// @downloadURL https://raw.githubusercontent.com/19rui90/zoe_clash.user/main/zoe_clash.user.js
 // @supportURL  https://greasefork.org/scripts/588299/feedback
 // ==/UserScript==
 
@@ -94,6 +98,7 @@
             autoMessage: 'Auto-Mensagem',
             suggestions: 'Sugestões',
             checkUpdates: 'Verificar atualizações',
+            versionHistory: 'Histórico de versões',
             sendMessageTo: 'Enviar para',
             none: 'Nenhuma',
             open: 'Aberto',
@@ -295,6 +300,7 @@
             autoMessage: 'Auto-Message',
             suggestions: 'Suggestions',
             checkUpdates: 'Check for updates',
+            versionHistory: 'Version history',
             sendMessageTo: 'Send to',
             none: 'None',
             open: 'Open',
@@ -496,6 +502,7 @@
             autoMessage: 'Auto-Mensaje',
             suggestions: 'Sugerencias',
             checkUpdates: 'Verificar actualizaciones',
+            versionHistory: 'Historial de versiones',
             sendMessageTo: 'Enviar a:',
             none: 'Ninguna',
             open: 'Abierto',
@@ -895,7 +902,8 @@
     const SCRIPT_VERSION = '1.2.6.1';
     const SCRIPT_ID = '588299';
     const UPDATE_CHECK_KEY = 'zoe_last_update_check';
-    const GITHUB_RAW_URL = ''; // <-- URL raw do teu .user.js no GitHub, ex: https://raw.githubusercontent.com/USER/REPO/main/zoe_clash.user.js
+    const GITHUB_RAW_URL = 'https://raw.githubusercontent.com/19rui90/zoe_clash.user/main/zoe_clash.user.js'; // <-- URL raw do teu .user.js no GitHub
+    const GITHUB_REPO = '19rui90/zoe_clash.user';
 
     function compareVersions(installed, latest) {
         const a = String(installed).split('.').map(n => parseInt(n, 10) || 0);
@@ -911,10 +919,10 @@
 
     async function checkForUpdates(manual = false) {
         try {
+            if (location.hostname !== 'www.managerzone.com') return;
             const lastCheck = GM_getValue(UPDATE_CHECK_KEY, 0);
             const now = Date.now();
-            if (!manual && now - lastCheck < 24 * 60 * 60 * 1000) {
-                console.log('ZOE Update: verificação recente, a saltar (última há', Math.round((now - lastCheck) / 3600000), 'horas)');
+            if (!manual && now - lastCheck < 10000) {
                 return;
             }
 
@@ -964,6 +972,85 @@
             console.log('ZOE Update: erro ao verificar atualizações:', e && e.message ? e.message : String(e));
         }
     }
+
+    async function fetchAvailableVersions() {
+        const out = [];
+        try {
+            const data = await new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url: 'https://api.github.com/repos/' + GITHUB_REPO + '/releases',
+                    timeout: 15000,
+                    headers: { 'Accept': 'application/vnd.github+json' },
+                    onload: (r) => { if (r.status === 200 && r.responseText) resolve(JSON.parse(r.responseText)); else reject(new Error('status=' + r.status)); },
+                    onerror: (e) => reject(e),
+                    ontimeout: () => reject(new Error('Timeout'))
+                });
+            });
+            for (const rel of data) { if (rel.tag_name) out.push({ tag: rel.tag_name, name: rel.name || rel.tag_name }); }
+        } catch (e) {
+            console.log('ZOE VersionHistory: releases falhou:', e && e.message ? e.message : String(e));
+        }
+        if (out.length === 0) {
+            try {
+                const data = await new Promise((resolve, reject) => {
+                    GM_xmlhttpRequest({
+                        method: 'GET',
+                        url: 'https://api.github.com/repos/' + GITHUB_REPO + '/tags',
+                        timeout: 15000,
+                        onload: (r) => { if (r.status === 200 && r.responseText) resolve(JSON.parse(r.responseText)); else reject(new Error('status=' + r.status)); },
+                        onerror: (e) => reject(e),
+                        ontimeout: () => reject(new Error('Timeout'))
+                    });
+                });
+                for (const tg of data) { if (tg.name) out.push({ tag: tg.name, name: tg.name }); }
+            } catch (e) {
+                console.log('ZOE VersionHistory: tags falhou:', e && e.message ? e.message : String(e));
+            }
+        }
+        return out;
+    }
+
+    function rawUrlForTag(tag) {
+        return 'https://raw.githubusercontent.com/' + GITHUB_REPO + '/' + encodeURIComponent(tag) + '/zoe_clash.user.js';
+    }
+
+    async function showVersionHistory() {
+        const modalId = 'zoe-version-history';
+        const existing = document.getElementById(modalId);
+        if (existing) existing.remove();
+        const modal = document.createElement('div');
+        modal.id = modalId;
+        modal.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:10000001;display:flex;align-items:center;justify-content:center;';
+        modal.innerHTML = '<div style="background:#fff;color:#222;padding:20px 24px;border-radius:10px;max-width:380px;width:90%;max-height:80%;overflow:auto;font-family:Segoe UI,Arial,sans-serif;">' +
+            '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;"><b style="font-size:16px">' + t('versionHistory') + '</b><span style="cursor:pointer;font-size:20px" id="' + modalId + '-close">✕</span></div>' +
+            '<div id="' + modalId + '-list" style="font-size:14px">A carregar...</div></div>';
+        document.body.appendChild(modal);
+        modal.addEventListener('click', (e) => { if (e.target === modal || e.target.id === modalId + '-close') modal.remove(); });
+        const listEl = modal.querySelector('#' + modalId + '-list');
+        try {
+            const versions = await fetchAvailableVersions();
+            if (versions.length === 0) {
+                listEl.textContent = 'Nenhuma versão anterior disponível.';
+            } else {
+                listEl.innerHTML = '';
+                versions.forEach(v => {
+                    const item = document.createElement('div');
+                    item.style.cssText = 'padding:8px 10px;border:1px solid #eee;border-radius:6px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;';
+                    item.innerHTML = '<span>' + (v.name || v.tag) + '</span>';
+                    const btn = document.createElement('button');
+                    btn.textContent = 'Instalar';
+                    btn.style.cssText = 'background:#4CAF50;color:#fff;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;';
+                    btn.onclick = () => { window.open(rawUrlForTag(v.tag), '_blank'); };
+                    item.appendChild(btn);
+                    listEl.appendChild(item);
+                });
+            }
+        } catch (e) {
+            listEl.textContent = 'Erro ao carregar versões: ' + (e && e.message ? e.message : String(e));
+        }
+    }
+    window.showVersionHistory = showVersionHistory;
 
     function showUpdateNotification(remoteVersion) {
         // Não mostrar notificação se já estiver aberta
@@ -1043,6 +1130,9 @@
                     Ignorar
                 </button>
             </div>
+            <div style="margin-top:8px;text-align:center;">
+                <a href="javascript:void(0)" onclick="showVersionHistory()" style="color:white;text-decoration:underline;font-size:13px;cursor:pointer;">${t('versionHistory')}</a>
+            </div>
         `;
         document.body.appendChild(notification);
 
@@ -1053,13 +1143,12 @@
         }, 600000);
     }
 
-    // Chamar periodicamente (a cada 24 horas)
-    setInterval(checkForUpdates, 24 * 60 * 60 * 1000);
-
-    // Chamar ao carregar (após 5 segundos para não atrasar o carregamento inicial)
-    setTimeout(checkForUpdates, 5000);
-
     if (location.hostname !== 'www.managerzone.com') return;
+
+    // Verificação de atualizações: em último plano, sem prioridade sobre as funções principais.
+    // Só no Managerzone; o check inicial ocorre após a página estar pronta (1h).
+    setTimeout(checkForUpdates, 3600000);
+    setInterval(checkForUpdates, 3600000);
 
     function detectCurrentSport() {
         const urlParam = (window.location.search.match(/changesport=(soccer|hockey)/) || [])[1];
@@ -1437,6 +1526,61 @@
         }
         console.log('ZOE Clash: extractRivalFedId — no rival found');
         return null;
+    }
+
+    // Extrai os fids das federações da tabela #standings (clash-standings)
+    function extractStandingsFids(html) {
+        const fids = [];
+        if (!html) return fids;
+        const blockMatch = html.match(/<div id="standings">([\s\S]*?)<\/div>\s*<\/div>/i) || html.match(/id="standings"[\s\S]*?<\/table>/i);
+        const block = blockMatch ? blockMatch[0] : html;
+        const re = /<a class="fed_link"[^>]*href="[^"]*fid=(\d+)/gi;
+        let m;
+        while ((m = re.exec(block)) !== null) {
+            if (!fids.includes(m[1])) fids.push(m[1]);
+        }
+        return fids;
+    }
+
+    // Vai buscar os fids da tabela #standings de uma página de clash (prev=1 ou atual)
+    async function fetchStandingsFids(sport, prev) {
+        const url = 'https://www.managerzone.com/?p=federations&sub=clash' + (prev ? '&prev=1' : '') + '&changesport=' + sport + '&_nocache=' + Date.now();
+        console.log('ZOE Clash: fallback standings — a buscar ' + (prev ? 'prev=1' : 'atual') + ':', url);
+        const html = await new Promise((resolve) => {
+            GM_xmlhttpRequest({
+                method: 'GET', url: url, timeout: 15000,
+                headers: { 'Referer': 'https://www.managerzone.com/?p=federations&sub=clash&changesport=' + sport },
+                onload: (r) => resolve(r.responseText || ''),
+                onerror: () => resolve(''), ontimeout: () => resolve('')
+            });
+        });
+        const fids = extractStandingsFids(html);
+        console.log('ZOE Clash: fallback standings — fids ' + (prev ? 'prev=1' : 'atual') + ' =', fids);
+        return fids;
+    }
+
+    // Fallback: determina ourId pela interseção das tabelas #standings (prev=1 ∩ atual).
+    // O fid comum às duas páginas é a nossa federação; o outro fid da página atual é o rival.
+    async function resolveOurFedIdViaStandings(sport) {
+        try {
+            const prevFids = await fetchStandingsFids(sport, true);
+            const curFids = await fetchStandingsFids(sport, false);
+            if (prevFids.length < 2 || curFids.length < 2) {
+                console.log('ZOE Clash: fallback standings — insuficientes fids (prev=' + prevFids.length + ', atual=' + curFids.length + ')');
+                return null;
+            }
+            const ourId = prevFids.find(f => curFids.includes(f)) || null;
+            if (!ourId) {
+                console.log('ZOE Clash: fallback standings — nenhum fid em comum entre prev=1 e atual');
+                return null;
+            }
+            const rivalId = curFids.find(f => f !== ourId) || null;
+            console.log('ZOE Clash: fallback standings — ourId =', ourId, '| rivalId =', rivalId);
+            return { ourId, rivalId };
+        } catch(e) {
+            console.error('ZOE Clash: erro no fallback standings:', e.message);
+            return null;
+        }
     }
 
     // --- Federation Data ---
@@ -2183,6 +2327,12 @@
     // --- Main Clash Flow ---
 
     async function startClashScreenshotFlow(autoRun) {
+        const now = Date.now();
+        if (startClashScreenshotFlow._running || now < (startClashScreenshotFlow._cooldownUntil || 0)) {
+            console.log('ZOE Clash: fluxo já em curso ou em cooldown — a ignorar clique repetido (debounce)');
+            return;
+        }
+        startClashScreenshotFlow._running = true;
                 if (autoRun) {
             console.log('ZOE AutoRun: a verificar condições para execução...');
  const lockAcquired = acquireRunLock();
@@ -2488,8 +2638,51 @@
             console.error('ZOE Clash: API sem dados de jogos, length =', tableHtml.trim().length);
             const storedIds = getFedIdStorage();
             const info = '<br><br><span style="font-size:11px;color:#aaa">IDs guardados — Futebol: <b style="color:#e94560">' + (storedIds.soccer || 'nenhum') + '</b> | Hoquei: <b style="color:#e94560">' + (storedIds.hockey || 'nenhum') + '</b></span>';
-            if (statusEl) statusEl.innerHTML = '<span style="color:#f44336">' + t('noGamesFound') + '</span>' + info;
-            return;
+            // FALLBACK: determinar ourId/rival pela interseção das tabelas #standings (prev=1 ∩ atual).
+            // Se houver um fid em comum (match), prosseguir com a lógica normal usando os IDs corrigidos;
+            // caso contrário, manter o erro.
+            let fb = null;
+            try { fb = await resolveOurFedIdViaStandings(sport); }
+            catch (fbe) { console.error('ZOE Clash: erro no fallback standings:', fbe.message); }
+            if (fb && fb.ourId && fb.rivalId) {
+                ourId = fb.ourId;
+                saveOurFedId(ourId);
+                console.log('ZOE Clash: fallback match — ourId corrigido =', ourId);
+                rivalId = fb.rivalId;
+                console.log('ZOE Clash: fallback match — rivalId =', rivalId);
+                if (statusEl) statusEl.textContent = 'Fallback: IDs corrigidos (ourId=' + ourId + ', rivalId=' + rivalId + '), a gerar imagem...';
+                const apiUrl2 = 'https://statsxente.com/MZ1/Functions/loadClashMatcher.php?fid=' + ourId + '&fid1=' + rivalId + '&idioma=PORTUGUES&divisa=EUR&sport=' + sport + '&type=' + clashSettings.clashType + '&start_date=' + thirtyDaysAgo + '&final_date=' + now + '&limit=3&teams_offered=' + (clashSettings.clashType === 'offer' ? clashSettings.teamsOffered : 0);
+                console.log('ZOE Clash: fallback match — nova API URL =', apiUrl2);
+                try {
+                    const tableHtml2 = await new Promise((resolve, reject) => {
+                        GM_xmlhttpRequest({
+                            method: 'GET', url: apiUrl2,
+                            onload: (r) => { console.log('ZOE Clash: fallback API response length =', r.responseText.length); resolve(r.responseText); },
+                            onerror: (e) => reject(new Error('Erro na API statsxente')),
+                            ontimeout: () => reject(new Error('Timeout na API statsxente'))
+                        });
+                    });
+                    const valid = tableHtml2 && tableHtml2.trim().length >= 500 && /<tr[\s>]/i.test(tableHtml2) && (tableHtml2.match(/<tr[\s>]/gi) || []).length >= 3;
+                    if (valid) {
+                        tableHtml = tableHtml2;
+                        if (statusEl) statusEl.textContent = t('generatingImage');
+                        logTiming('fallbackDadosAPI');
+                        // continuar para a geração de imagem/upload/publicação abaixo (sem return)
+                    } else {
+                        console.log('ZOE Clash: fallback match mas a API continua sem jogos — manter erro');
+                        if (statusEl) statusEl.innerHTML = '<span style="color:#f44336">' + t('noGamesFound') + '</span>' + info;
+                        return;
+                    }
+                } catch(e) {
+                    console.error('ZOE Clash: erro no fallback API:', e.message);
+                    if (statusEl) statusEl.innerHTML = '<span style="color:#f44336">' + t('noGamesFound') + '</span>' + info;
+                    return;
+                }
+            } else {
+                console.log('ZOE Clash: fallback — sem match entre prev=1 e atual — manter erro');
+                if (statusEl) statusEl.innerHTML = '<span style="color:#f44336">' + t('noGamesFound') + '</span>' + info;
+                return;
+            }
         }
         if (statusEl) statusEl.textContent = t('generatingImage');
         logTiming('dadosAPI');
@@ -2683,6 +2876,8 @@
     } finally {
         setPageLock(false);
         if (autoRun) releaseRunLock();
+        startClashScreenshotFlow._running = false;
+        startClashScreenshotFlow._cooldownUntil = Date.now() + 3000;
     }
     }
 
@@ -3002,7 +3197,7 @@ logTiming('Imagem gerada');
         html += '<textarea id="zoe-cfg-autoMessageTemplate" style="display:none">' + (s.autoMessageTemplate || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;') + '</textarea>';
         html += '</div>';
 
-        html += '<div style="display:flex;justify-content:flex-end;align-items:center;gap:12px"><a href="https://www.managerzone.com/?p=profile&uid=6921358&sport=soccer" target="_blank" id="zoe-cfg-sugestao-link" style="color:#f44336;font-size:12px;text-decoration:none;cursor:pointer;margin-right:auto">' + t('suggestions') + '</a><button id="zoe-cfg-check-updates" style="background:#555;color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px">' + t('checkUpdates') + '</button><button id="zoe-clash-cfg-save" style="background:' + accent + ';color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px">' + t('save') + '</button></div>';
+        html += '<div style="display:flex;justify-content:flex-end;align-items:center;gap:12px"><a href="https://www.managerzone.com/?p=profile&uid=6921358&sport=soccer" target="_blank" id="zoe-cfg-sugestao-link" style="color:#f44336;font-size:12px;text-decoration:none;cursor:pointer;margin-right:auto">' + t('suggestions') + '</a><button id="zoe-cfg-version-history" style="background:#555;color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px">' + t('versionHistory') + '</button><button id="zoe-cfg-check-updates" style="background:#555;color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px">' + t('checkUpdates') + '</button><button id="zoe-clash-cfg-save" style="background:' + accent + ';color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px">' + t('save') + '</button></div>';
 
         panel.innerHTML = html;
         doc.body.appendChild(panel);
@@ -3344,6 +3539,11 @@ logTiming('Imagem gerada');
                     checkUpdatesBtn.textContent = t('checkUpdates');
                 });
             };
+        }
+
+        const versionHistoryBtn = panel.querySelector('#zoe-cfg-version-history');
+        if (versionHistoryBtn) {
+            versionHistoryBtn.onclick = () => { showVersionHistory(); };
         }
     }
 
@@ -4463,6 +4663,7 @@ logTiming('Imagem gerada');
         const lines = String(body || '').split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
         const linesToSend = lines.length > 0 ? lines : [String(body || '').trim()];
         let sentCount = 0;
+        let beforeCount = frame.contentDocument.querySelectorAll('.messenger-dialog.active .messenger-row.you').length;
         for (const line of linesToSend) {
             input.focus();
             input.innerText = line;
@@ -4476,18 +4677,20 @@ logTiming('Imagem gerada');
                 console.error('ZOE AutoMsg: botão de envio não encontrado para ' + receiverName + ' (linha: ' + line.substring(0, 40) + ')');
                 return false;
             }
-            clickInFrame(frame, sendBtn);
             const first = line.substring(0, 60);
+            clickInFrame(frame, sendBtn);
             const sent = await waitForInFrame(frame, (f) => {
                 const d = f.contentDocument;
                 if (!d) return null;
                 const rows = d.querySelectorAll('.messenger-dialog.active .messenger-row.you');
-                for (const r of rows) {
-                    if (first && (r.textContent || '').indexOf(first) >= 0) return true;
+                if (rows.length <= beforeCount) return null;
+                for (let i = rows.length - 1; i >= beforeCount; i--) {
+                    if (first && (rows[i].textContent || '').indexOf(first) >= 0) return true;
                 }
                 return null;
             }, 8000);
             if (sent) {
+                beforeCount = frame.contentDocument.querySelectorAll('.messenger-dialog.active .messenger-row.you').length;
                 sentCount++;
                 console.log('ZOE AutoMsg: linha enviada a ' + receiverName + ': "' + first + (line.length > 60 ? '…' : '') + '"');
             } else {
@@ -4895,9 +5098,15 @@ logTiming('Imagem gerada');
     }
 
     async function executeAutoMessage(sport, fromAuto, selectedUids) {
+        if (window.__zoeAutoMsgSendInFlight) {
+            console.log('ZOE AutoMsg: envio já em curso noutro processo, a ignorar para evitar duplicados/ordem trocada');
+            return;
+        }
+        window.__zoeAutoMsgSendInFlight = true;
         const settings = getClashSettings(sport);
         if (!settings.autoMessage || !(settings.autoMessageTemplate && settings.autoMessageTemplate.trim())) {
             console.log('ZOE AutoMsg: desativado');
+            window.__zoeAutoMsgSendInFlight = false;
             return;
         }
                 if (fromAuto) {
@@ -5032,6 +5241,7 @@ logTiming('Imagem gerada');
             console.error('ZOE AutoMsg: erro ao enviar:', e.message);
             await scheduleAutoMessage(sport).catch(function(err) { console.log('ZOE AutoMsg: erro ao reagendar:', err); });
         } finally {
+            window.__zoeAutoMsgSendInFlight = false;
             if (fromAuto) releaseRunLock();
         }
     }
@@ -5124,6 +5334,11 @@ logTiming('Imagem gerada');
             console.log('ZOE Chat: desativado (checkbox ou template vazio)');
             return;
         }
+        if (window.__zoeChatSendInFlight) {
+            console.log('ZOE Chat: envio já em curso noutro processo, a ignorar para evitar duplicados/ordem trocada');
+            return;
+        }
+        window.__zoeChatSendInFlight = true;
         try {
             const nextRound = await fetchNextRoundData(sport);
             const round = pageInfo && pageInfo.round ? parseInt(pageInfo.round, 10) : (nextRound ? nextRound.round : null);
@@ -5196,6 +5411,8 @@ logTiming('Imagem gerada');
             }
         } catch(e) {
             console.error('ZOE Chat: erro ao enviar:', e.message);
+        } finally {
+            window.__zoeChatSendInFlight = false;
         }
     }
 
@@ -5211,6 +5428,34 @@ logTiming('Imagem gerada');
         }
         injectClashIcon();
         const sport = detectCurrentSport();
+
+        // DEBUG (pode remover em produção): expõe helpers para testar o fallback na consola.
+        // Ex.:  await ZoeDebug.resolveStandings('soccer')   -> {ourId, rivalId} ou null
+        //       await ZoeDebug.fetchStandings('soccer', true) -> fids da página prev=1
+        //       await ZoeDebug.fetchStandings('soccer', false) -> fids da página atual
+        window.ZoeDebug = {
+            resolveStandings: (s) => resolveOurFedIdViaStandings(s || sport),
+            fetchStandings: (s, prev) => fetchStandingsFids(s || sport, prev),
+            extract: (html) => extractStandingsFids(html)
+        };
+        if (window.location.search.includes('zoe_selftest=1')) {
+            console.log('ZOE DEBUG selftest: a testar fallback standings para sport=' + sport);
+            (async () => {
+                try {
+                    const prev = await fetchStandingsFids(sport, true);
+                    const cur = await fetchStandingsFids(sport, false);
+                    console.log('ZOE DEBUG selftest: fids prev=1 =', prev);
+                    console.log('ZOE DEBUG selftest: fids atual  =', cur);
+                    const fb = await resolveOurFedIdViaStandings(sport);
+                    console.log('ZOE DEBUG selftest: resultado =', JSON.stringify(fb));
+                    if (fb && fb.ourId && fb.rivalId) console.log('ZOE DEBUG selftest: MATCH encontrado (ourId=' + fb.ourId + ', rivalId=' + fb.rivalId + ')');
+                    else console.log('ZOE DEBUG selftest: SEM MATCH — o erro seria mantido');
+                } catch (e) {
+                    console.error('ZOE DEBUG selftest: erro =', e.message);
+                }
+            })();
+        }
+
         setTimeout(() => { scheduleAutoRun(sport).catch(function(e) { console.log('ZOE AutoRun: erro ao agendar:', e); }); }, 3000);
         setTimeout(() => { scheduleAutoMessage(sport).catch(function(e) { console.log('ZOE AutoMsg: erro ao agendar:', e); }); }, 3000);
     }
