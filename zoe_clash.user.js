@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ZOE - Clash Screenshot
 // @namespace    https://www.managerzone.com/
-// @version      1.2.6.3
+// @version      1.2.6.4
 // @description  Gera imagens do Clash Matcher com upload e guestbook
 // @author       ruisimoes
 // @license      MIT
@@ -899,7 +899,7 @@
     }
 
     // --- Update Checker ---
-    const SCRIPT_VERSION = '1.2.6.1';
+    const SCRIPT_VERSION = '1.2.6.4';
     const SCRIPT_ID = '588299';
     const UPDATE_CHECK_KEY = 'zoe_last_update_check';
     const GITHUB_RAW_URL = 'https://raw.githubusercontent.com/19rui90/zoe_clash.user/main/zoe_clash.user.js'; // <-- URL raw do teu .user.js no GitHub
