@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ZOE - Clash Screenshot
 // @namespace    https://www.managerzone.com/
-// @version      1.2.6.4
+// @version      1.2.6.5
 // @description  Gera imagens do Clash Matcher com upload e guestbook
 // @author       ruisimoes
 // @license      MIT
@@ -899,7 +899,7 @@
     }
 
     // --- Update Checker ---
-    const SCRIPT_VERSION = '1.2.6.4';
+    const SCRIPT_VERSION = '1.2.6.5';
     const SCRIPT_ID = '588299';
     const UPDATE_CHECK_KEY = 'zoe_last_update_check';
     const GITHUB_RAW_URL = 'https://raw.githubusercontent.com/19rui90/zoe_clash.user/main/zoe_clash.user.js'; // <-- URL raw do teu .user.js no GitHub
@@ -3655,17 +3655,23 @@ logTiming('Imagem gerada');
             let season = '';
             let division = '';
 
-            const ajaxUrlMatch = html.match(/ajax\.php\?p=federations&sub=schedule[^"']+/);
-            if (!ajaxUrlMatch) { console.log('ZOE AutoRun: URL schedule AJAX não encontrada'); return null; }
-            const scheduleAjaxUrl = 'https://www.managerzone.com/' + ajaxUrlMatch[0];
+            const ajaxUrlMatches = (html.match(/ajax\.php\?p=federations&sub=schedule[^"']+/g) || [])
+                .map(u => u.replace(/&amp;/g, '&'));
+            const ajaxUrlWithDiv = ajaxUrlMatches.find(u => /[?&]level=\d+/.test(u) && /[?&]div=\d+/.test(u));
+            const scrapedUrl = ajaxUrlWithDiv || ajaxUrlMatches[0];
+            if (!scrapedUrl) { console.log('ZOE AutoRun: URL schedule AJAX não encontrada'); return null; }
+            let scheduleAjaxUrl = 'https://www.managerzone.com/' + scrapedUrl;
             console.log('ZOE AutoRun: AJAX schedule URL:', scheduleAjaxUrl);
-            const ajaxHtml = await new Promise((resolve, reject) => {
+
+            const fetchScheduleAjax = (url) => new Promise((resolve) => {
                 GM_xmlhttpRequest({
-                    method: 'GET', url: scheduleAjaxUrl,
-                    onload: (r) => resolve(r.responseText),
+                    method: 'GET', url,
+                    onload: (r) => resolve(r.responseText || ''),
                     onerror: () => resolve(''), ontimeout: () => resolve('')
                 });
             });
+
+            let ajaxHtml = await fetchScheduleAjax(scheduleAjaxUrl);
             console.log('ZOE AutoRun: AJAX resposta length:', ajaxHtml.length);
 
             const seasonMatch = ajaxHtml.match(/data-season='(\d+)'[^>]*data-sub-season='(\d+)'/);
@@ -3690,6 +3696,34 @@ logTiming('Imagem gerada');
             if (!division) {
                 const divMatch = scheduleAjaxUrl.match(/level=(\d+)&div=(\d+)/);
                 if (divMatch) division = divMatch[1] + '.' + divMatch[2];
+            }
+
+            // URL sem level/div (ex.: hóquei): reconstruir a partir da divisão e validar que o calendário contém a nossa fed
+            const ourFidRe = new RegExp('fid=' + ourFedId + '(?![0-9])');
+            if (!ourFidRe.test(ajaxHtml) && division) {
+                const divParts = division.split('.').map(n => parseInt(n, 10));
+                if (divParts.length === 2 && !isNaN(divParts[0]) && !isNaN(divParts[1]) && divParts[1] >= 1) {
+                    // divisão "X.Y" ↔ level=(X+1)&div=Y; testar também X e X-1
+                    const candidates = [...new Set([divParts[0] + 1, divParts[0], divParts[0] - 1])].filter(l => l >= 1);
+                    for (const lev of candidates) {
+                        const candidateUrl = 'https://www.managerzone.com/ajax.php?p=federations&sub=schedule&level=' + lev + '&div=' + divParts[1] + '&sport=' + sport;
+                        console.log('ZOE AutoRun: calendário sem fid=' + ourFedId + ', a tentar URL alternativo:', candidateUrl);
+                        const candidateHtml = await fetchScheduleAjax(candidateUrl);
+                        if (candidateHtml && ourFidRe.test(candidateHtml)) {
+                            console.log('ZOE AutoRun: URL alternativo válido — level=' + lev + '&div=' + divParts[1]);
+                            scheduleAjaxUrl = candidateUrl;
+                            ajaxHtml = candidateHtml;
+                            break;
+                        }
+                    }
+                    if (!ourFidRe.test(ajaxHtml)) {
+                        console.log('ZOE AutoRun: nenhum URL alternativo contém fid=' + ourFedId + ', a manter resposta original');
+                    }
+                }
+                if (!season) {
+                    const seasonRetry = ajaxHtml.match(/data-season='(\d+)'[^>]*data-sub-season='(\d+)'/);
+                    if (seasonRetry) season = seasonRetry[1] + '.' + seasonRetry[2];
+                }
             }
             const levMatch = scheduleAjaxUrl.match(/level=(\d+)/);
             const dviMatch = scheduleAjaxUrl.match(/[?&]div=(\d+)/);
