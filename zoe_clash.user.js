@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ZOE - Clash Screenshot
 // @namespace    https://www.managerzone.com/
-// @version      1.2.6.5
+// @version      1.2.6.6
 // @description  Gera imagens do Clash Matcher com upload e guestbook
 // @author       ruisimoes
 // @license      MIT
@@ -899,9 +899,14 @@
     }
 
     // --- Update Checker ---
-    const SCRIPT_VERSION = '1.2.6.5';
+    // Versão lida diretamente do cabeçalho @version (só é preciso alterar aí)
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version)
+        ? String(GM_info.script.version)
+        : 'desconhecida';
     const SCRIPT_ID = '588299';
     const UPDATE_CHECK_KEY = 'zoe_last_update_check';
+    const UPDATE_SNOOZE_KEY = 'zoe_update_snooze_until';
+    const UPDATE_SNOOZE_MS = 7 * 24 * 60 * 60 * 1000; // 1 semana
     const GITHUB_RAW_URL = 'https://raw.githubusercontent.com/19rui90/zoe_clash.user/main/zoe_clash.user.js'; // <-- URL raw do teu .user.js no GitHub
     const GITHUB_REPO = '19rui90/zoe_clash.user';
 
@@ -963,14 +968,65 @@
             GM_setValue(UPDATE_CHECK_KEY, Date.now());
 
             if (compareVersions(SCRIPT_VERSION, remoteVersion) < 0) {
-                console.log('ZOE Update: nova versão disponível!', SCRIPT_VERSION, '->', remoteVersion);
-                showUpdateNotification(remoteVersion);
+                const snoozeUntil = GM_getValue(UPDATE_SNOOZE_KEY, 0);
+                if (!manual && snoozeUntil > Date.now()) {
+                    console.log('ZOE Update: nova versão disponível!', SCRIPT_VERSION, '->', remoteVersion, '— aviso silenciado até', new Date(snoozeUntil).toLocaleString());
+                } else {
+                    if (manual && snoozeUntil > Date.now()) {
+                        console.log('ZOE Update: verificação manual — silêncio do aviso ignorado');
+                    }
+                    console.log('ZOE Update: nova versão disponível!', SCRIPT_VERSION, '->', remoteVersion);
+                    showUpdateNotification(remoteVersion);
+                }
             } else {
                 console.log('ZOE Update: script está atualizado (v' + SCRIPT_VERSION + ')');
             }
         } catch(e) {
             console.log('ZOE Update: erro ao verificar atualizações:', e && e.message ? e.message : String(e));
         }
+    }
+
+    async function fetchVersionsFromCommits() {
+        const out = [];
+        try {
+            const commits = await new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url: 'https://api.github.com/repos/' + GITHUB_REPO + '/commits?path=zoe_clash.user.js&per_page=100',
+                    timeout: 15000,
+                    headers: { 'Accept': 'application/vnd.github+json' },
+                    onload: (r) => { if (r.status === 200 && r.responseText) resolve(JSON.parse(r.responseText)); else reject(new Error('status=' + r.status)); },
+                    onerror: (e) => reject(e),
+                    ontimeout: () => reject(new Error('Timeout'))
+                });
+            });
+            const seen = new Set();
+            for (const c of commits.slice(0, 30)) {
+                const sha = c && c.sha;
+                if (!sha) continue;
+                try {
+                    const text = await new Promise((resolve, reject) => {
+                        GM_xmlhttpRequest({
+                            method: 'GET',
+                            url: 'https://raw.githubusercontent.com/' + GITHUB_REPO + '/' + sha + '/zoe_clash.user.js',
+                            timeout: 15000,
+                            onload: (r) => { if (r.status === 200 && r.responseText) resolve(r.responseText); else reject(new Error('status=' + r.status)); },
+                            onerror: (e) => reject(e),
+                            ontimeout: () => reject(new Error('Timeout'))
+                        });
+                    });
+                    const m = text.match(/\/\/\s*@version\s+([\d.]+)/);
+                    if (!m) continue;
+                    if (seen.has(m[1])) continue;
+                    seen.add(m[1]);
+                    out.push({ tag: sha, name: 'v' + m[1] });
+                } catch (e) {}
+            }
+        } catch (e) {
+            console.log('ZOE VersionHistory: commits falhou:', e && e.message ? e.message : String(e));
+        }
+        out.sort((a, b) => compareVersions(b.name.replace(/^v/, ''), a.name.replace(/^v/, '')));
+        return out;
     }
 
     async function fetchAvailableVersions() {
@@ -1008,6 +1064,13 @@
                 console.log('ZOE VersionHistory: tags falhou:', e && e.message ? e.message : String(e));
             }
         }
+        if (out.length === 0) {
+            const fromCommits = await fetchVersionsFromCommits();
+            if (fromCommits.length > 0) {
+                console.log('ZOE VersionHistory: versões obtidas dos commits =', fromCommits.map(v => v.name));
+                out.push(...fromCommits);
+            }
+        }
         return out;
     }
 
@@ -1033,11 +1096,33 @@
             if (versions.length === 0) {
                 listEl.textContent = 'Nenhuma versão anterior disponível.';
             } else {
+                const verOf = (v) => {
+                    const m = String((v.name || '') + ' ' + (v.tag || '')).match(/(\d+(?:\.\d+)+)/);
+                    return m ? m[1] : null;
+                };
+                let latestVersion = null;
+                versions.forEach(v => {
+                    const ver = verOf(v);
+                    if (ver && (!latestVersion || compareVersions(ver, latestVersion) > 0)) latestVersion = ver;
+                });
                 listEl.innerHTML = '';
                 versions.forEach(v => {
                     const item = document.createElement('div');
                     item.style.cssText = 'padding:8px 10px;border:1px solid #eee;border-radius:6px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;';
-                    item.innerHTML = '<span>' + (v.name || v.tag) + '</span>';
+                    const ver = verOf(v);
+                    const isCurrent = ver && compareVersions(ver, SCRIPT_VERSION) === 0;
+                    const isLatest = ver && latestVersion && compareVersions(ver, latestVersion) === 0;
+                    let suffix = '';
+                    let color = '';
+                    if (isCurrent) {
+                        suffix = ' (versão atual)';
+                        color = isLatest ? '#2e7d32' : '#c62828';
+                    } else if (isLatest) {
+                        suffix = ' (versão mais recente)';
+                        color = '#2e7d32';
+                    }
+                    const labelStyle = color ? 'color:' + color + ';font-weight:bold;' : '';
+                    item.innerHTML = '<span style="' + labelStyle + '">' + (v.name || v.tag) + suffix + '</span>';
                     const btn = document.createElement('button');
                     btn.textContent = 'Instalar';
                     btn.style.cssText = 'background:#4CAF50;color:#fff;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;';
@@ -1121,7 +1206,7 @@
                    onmouseout="this.style.transform='scale(1)'">
                     Atualizar agora
                 </a>
-                <button onclick="document.getElementById('zoe-update-notification').remove()"
+                <button id="zoe-update-ignore"
                         style="background: rgba(255,255,255,0.2); border: none; color: white;
                                padding: 10px 16px; border-radius: 8px; cursor: pointer;
                                transition: background 0.2s;"
@@ -1131,23 +1216,41 @@
                 </button>
             </div>
             <div style="margin-top:8px;text-align:center;">
-                <a href="javascript:void(0)" onclick="showVersionHistory()" style="color:white;text-decoration:underline;font-size:13px;cursor:pointer;">${t('versionHistory')}</a>
+                <a href="javascript:void(0)" id="zoe-update-version-history" style="color:white;text-decoration:underline;font-size:13px;cursor:pointer;">${t('versionHistory')}</a>
             </div>
         `;
         document.body.appendChild(notification);
 
-        // Auto-remove após 10 minutos
+        const historyLink = notification.querySelector('#zoe-update-version-history');
+        if (historyLink) {
+            historyLink.onclick = (e) => {
+                e.preventDefault();
+                showVersionHistory();
+            };
+        }
+
+        const ignoreBtn = notification.querySelector('#zoe-update-ignore');
+        if (ignoreBtn) {
+            ignoreBtn.onclick = () => {
+                const until = Date.now() + UPDATE_SNOOZE_MS;
+                GM_setValue(UPDATE_SNOOZE_KEY, until);
+                console.log('ZOE Update: aviso ignorado até', new Date(until).toLocaleString());
+                notification.remove();
+            };
+        }
+
+        // Auto-remove após 1 minuto
         setTimeout(() => {
             const notif = document.getElementById('zoe-update-notification');
             if (notif) notif.remove();
-        }, 600000);
+        }, 60000);
     }
 
     if (location.hostname !== 'www.managerzone.com') return;
 
     // Verificação de atualizações: em último plano, sem prioridade sobre as funções principais.
-    // Só no Managerzone; o check inicial ocorre após a página estar pronta (1h).
-    setTimeout(checkForUpdates, 3600000);
+    // Só no Managerzone; o check inicial ocorre após a página estar pronta (15s).
+    setTimeout(checkForUpdates, 15000);
     setInterval(checkForUpdates, 3600000);
 
     function detectCurrentSport() {
