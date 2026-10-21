@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ZOE - Clash Screenshot
 // @namespace    https://www.managerzone.com/
-// @version      1.2.6.6
+// @version      1.2.6.7
 // @description  Gera imagens do Clash Matcher com upload e guestbook
 // @author       ruisimoes
 // @license      MIT
@@ -31,6 +31,54 @@
     'use strict';
 
     const GOOGLE_APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwx8MX_3l_bMga46UQ0SxQeW0fx8kqD2vEKi0H7pAT9-8XBoTHd8j7fJuZUIRy5B7OhyQ/exec';
+    const REMOTE_LOG_ACTION = 'clashLog';
+    const ZOE_LOG_MAX_ENTRIES = 600;
+    const ZOE_LOG_MAX_TEXT = 3000;
+    const zoeLogBuffer = [];
+    let zoeLogSeq = 0;
+
+    function zoeRedactLogText(value) {
+        let text = String(value);
+        text = text.replace(/data:image\/[a-z]+;base64,[A-Za-z0-9+/=]+/gi, 'data:image/[base64 omitted]');
+        text = text.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '[email]');
+        text = text.replace(/(password|passwd|pwd|token|cookie|sessionid|session_id|authorization)\s*[:=]\s*[^\s,;]+/gi, '$1=[redacted]');
+        text = text.replace(/[A-Za-z0-9+/=]{500,}/g, '[base64 omitted]');
+        if (text.length > ZOE_LOG_MAX_TEXT) text = text.slice(0, ZOE_LOG_MAX_TEXT) + '…[truncated]';
+        return text;
+    }
+
+    function zoeFormatLogArg(arg) {
+        try {
+            if (arg instanceof Error) return zoeRedactLogText(arg.stack || (arg.name + ': ' + arg.message));
+            if (typeof arg === 'string') return zoeRedactLogText(arg);
+            if (arg === null || arg === undefined || typeof arg === 'number' || typeof arg === 'boolean') return String(arg);
+            if (typeof arg === 'object') {
+                try { return zoeRedactLogText(JSON.stringify(arg)); }
+                catch(e) { return zoeRedactLogText(String(arg)); }
+            }
+            return zoeRedactLogText(String(arg));
+        } catch(e) {
+            return '[unserializable]';
+        }
+    }
+
+    (function hookZoeConsole() {
+        ['log', 'info', 'warn', 'error'].forEach(level => {
+            const original = console[level];
+            if (typeof original !== 'function') return;
+            try {
+                console[level] = function() {
+                    try {
+                        const msg = Array.prototype.slice.call(arguments).map(zoeFormatLogArg).join(' ');
+                        zoeLogBuffer.push({ seq: ++zoeLogSeq, ts: new Date().toISOString(), level: level, msg: msg });
+                        if (zoeLogBuffer.length > ZOE_LOG_MAX_ENTRIES) zoeLogBuffer.shift();
+                    } catch(e) {}
+                    return original.apply(console, arguments);
+                };
+            } catch(e) {}
+        });
+    })();
+
     const FED_USERNAMES_KEY = 'zoe_fed_usernames';
     const FED_ID_KEY = 'zoe_our_fed_id';
     const IMGBB_KEY = 'f6f8b2c947f5e122f3e234a39d654110';
@@ -68,6 +116,8 @@
             autoMessageTemplate: 'Template do AutoMessage',
             chatToManagers: 'Chat para Managers',
             chatTemplate: 'Template do Chat',
+            sendDiagnosticLogs: 'Enviar logs de diagnóstico',
+            sendDiagnosticLogsTooltip: 'Envia um registo técnico ao autor sempre que uma imagem é gerada com sucesso (sem emails nem passwords).',
             save: 'Guardar',
             cancel: 'Cancelar',
             soccer: 'Futebol',
@@ -269,6 +319,8 @@
             autoMessageTemplate: 'AutoMessage Template',
             chatToManagers: 'Chat to Managers',
             chatTemplate: 'Chat Template',
+            sendDiagnosticLogs: 'Send diagnostic logs',
+            sendDiagnosticLogsTooltip: 'Sends a technical report to the author whenever an image is generated successfully (no emails or passwords).',
             language: 'Language',
             save: 'Save',
             cancel: 'Cancel',
@@ -471,6 +523,8 @@
             autoMessageTemplate: 'Template de AutoMessage',
             chatToManagers: 'Chat a Managers',
             chatTemplate: 'Template de Chat',
+            sendDiagnosticLogs: 'Enviar registros de diagnóstico',
+            sendDiagnosticLogsTooltip: 'Envía un registro técnico al autor siempre que se genera una imagen correctamente (sin correos ni contraseñas).',
             language: 'Idioma',
             save: 'Guardar',
             cancel: 'Cancelar',
@@ -1454,7 +1508,8 @@
             })(cfg && cfg.autoMessageBefore),
             autoMessageTemplate: (cfg && cfg.autoMessageTemplate) || '',
             chatToManagers: cfg ? cfg.chatToManagers === true : false,
-            chatTemplate: (cfg && cfg.chatTemplate) || ''
+            chatTemplate: (cfg && cfg.chatTemplate) || '',
+            sendDiagnosticLogs: cfg ? cfg.sendDiagnosticLogs !== false : true
         };
     }
 
@@ -1747,6 +1802,41 @@
             console.log('ZOE: Resposta do web app (postFederationData):', resp);
         } catch(e) {
             console.error('ZOE: Erro ao enviar dados da federação:', e.message);
+        }
+    }
+
+    async function sendClashDiagnosticLog(payload) {
+        const baseUrl = getGoogleAppsScriptUrl();
+        if (!baseUrl) return false;
+        try {
+            const body = JSON.stringify(Object.assign({ action: REMOTE_LOG_ACTION }, payload));
+            const resp = await new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method: 'POST',
+                    url: baseUrl,
+                    headers: { 'Content-Type': 'text/plain' },
+                    data: body,
+                    timeout: 30000,
+                    onload: (r) => resolve(r.responseText || ''),
+                    onerror: () => reject(new Error('Falha ao enviar log')),
+                    ontimeout: () => reject(new Error('Timeout ao enviar log'))
+                });
+            });
+            const text = String(resp || '');
+            let accepted = false;
+            try {
+                const json = JSON.parse(text);
+                accepted = !!(json && (json.ok === true || json.success === true));
+            } catch(e) {}
+            if (!accepted && /(não encontrada|not found|error|erro)/i.test(text)) {
+                console.warn('ZOE Log: servidor recusou o log — verificar doPost no Apps Script:', text.slice(0, 200));
+                return false;
+            }
+            console.log('ZOE Log: diagnóstico enviado (' + body.length + ' bytes) — resposta:', text.slice(0, 120));
+            return true;
+        } catch(e) {
+            console.warn('ZOE Log: não foi possível enviar diagnóstico:', e.message);
+            return false;
         }
     }
 
@@ -2446,10 +2536,22 @@
             }
             startRunLockHeartbeat();
         }
+        let flowImageGenerated = false;
+        const flowImageUrls = {};
+        let flowGuestbookPosted = null;
+        let flowChatResult = { status: 'not-attempted' };
+        let flowLogContext = null;
+        let flowError = null;
+        const flowTimings = {};
+        const flowLogStartSeq = zoeLogSeq;
         setPageLock(true);
         try {
         const t0 = performance.now();
-        const logTiming = (label) => { console.log('ZOE TIMING: ' + label + ' — ' + (performance.now() - t0).toFixed(0) + 'ms'); };
+        const logTiming = (label) => {
+            const ms = Math.round(performance.now() - t0);
+            flowTimings[label] = ms;
+            console.log('ZOE TIMING: ' + label + ' — ' + ms + 'ms');
+        };
         let statusEl = document.getElementById('zoe-status');
         if (!statusEl) {
             statusEl = document.createElement('div');
@@ -2891,6 +2993,8 @@
                 if (canvasPlain.height < 50) throw new Error('Tabela demasiado pequena (' + canvasPlain.width + 'x' + canvasPlain.height + ') - nenhum jogo encontrado');
                 const clashFileNamePlain = buildClashFileName(clashSettings);
                 imgUrlPlain = await uploadImage(blobPlain, clashSettings.imgExpiration, clashFileNamePlain);
+                flowImageGenerated = true;
+                flowImageUrls.plain = imgUrlPlain;
                 console.log('ZOE Clash: upload plain concluido =', imgUrlPlain);
                 logTiming('screenshotPlain');
                 if (!autoRun) {
@@ -2932,10 +3036,13 @@
                 if (canvasStats.height < 50) throw new Error('Tabela stats demasiado pequena (' + canvasStats.width + 'x' + canvasStats.height + ')');
                 const clashFileNameStats = buildClashFileName(clashSettings).replace('.png', '_stats.png');
                 imgUrlStats = await uploadImage(blobStats, clashSettings.imgExpiration, clashFileNameStats);
+                flowImageGenerated = true;
+                flowImageUrls.stats = imgUrlStats;
                 console.log('ZOE Clash: upload stats concluido =', imgUrlStats);
                 logTiming('screenshotStats');
             }
             if (statusEl) statusEl.textContent = t('imageGenerated');
+            flowLogContext = { sport: sport, ourId: ourId, rivalId: rivalId, autoRun: !!autoRun, pageInfo: null };
             const clashSettings2 = getClashSettings(sport);
             let pageInfo = null;
             if (clashSettings2.guestbookTemplate && clashSettings2.guestbookTemplate.trim()) {
@@ -2947,6 +3054,7 @@
                     }
                 }
                                 pageInfo = scheduleData ? { round: String(scheduleData.round), season: scheduleData.season || '', division: scheduleData.division || '', rival: scheduleData.rivalName || '' } : extractClashPageInfo();
+                if (flowLogContext && pageInfo) flowLogContext.pageInfo = { round: pageInfo.round, season: pageInfo.season, division: pageInfo.division, rival: pageInfo.rival };
                 const hasImagePlaceholder = /\*image\*/.test(clashSettings2.guestbookTemplate);
                 const hasImageStats = /\*image_stats\*/.test(clashSettings2.guestbookTemplate);
                 const eloRows = parseClashMatchupTable(tableHtml);
@@ -2955,13 +3063,19 @@
                 const msg = buildGuestbookMessage(clashSettings2.guestbookTemplate, pageInfo, (hasImagePlaceholder && imgUrlPlain) ? imgUrlPlain : null, eloBlock, eloRows, false, (hasImageStats && imgUrlStats) ? imgUrlStats : null);
                 console.log('ZOE Clash: guestbook message =', msg);
                 const postedOk = await postToGuestbook(msg, sport, clashSettings2.boardType, ourId);
+                flowGuestbookPosted = postedOk;
                 logTiming('postGuestbook');
+                console.log('ZOE Clash: gate do chat | postedOk=' + postedOk + ' | chatToManagers=' + !!clashSettings2.chatToManagers + ' | templateLen=' + String(clashSettings2.chatTemplate || '').length + ' | autoRun=' + !!autoRun + ' | visibility=' + document.visibilityState);
                 if (postedOk && clashSettings2.chatToManagers && clashSettings2.chatTemplate && clashSettings2.chatTemplate.trim()) {
                     console.log('ZOE Clash: imagem postada com sucesso, a enviar mensagens do chat aos managers...');
-                    await executeChatSend(sport, pageInfo, eloRows, ourId);
+                    flowChatResult = (await executeChatSend(sport, pageInfo, eloRows, ourId)) || { status: 'unknown' };
                     logTiming('postChat');
                 } else if (!postedOk) {
-                    console.log('ZOE Chat: imagem não postada, sem envio de mensagens do chat');
+                    flowChatResult = { status: 'guestbook-failed' };
+                    console.log('ZOE Chat: imagem não postada, sem envio de mensagens do chat | postedOk=' + postedOk + ' | chatToManagers=' + !!clashSettings2.chatToManagers + ' | templateLen=' + String(clashSettings2.chatTemplate || '').length);
+                } else {
+                    flowChatResult = { status: 'disabled' };
+                    console.log('ZOE Chat: desativado no fluxo | chatToManagers=' + !!clashSettings2.chatToManagers + ' | templateLen=' + String(clashSettings2.chatTemplate || '').length);
                 }
             }
             if (autoRun) {
@@ -2971,6 +3085,7 @@
                 logTiming('total');
             }
         } catch(e) {
+            flowError = e.message;
             console.error('ZOE Clash: erro ao gerar/upload imagem:', e.message);
             if (statusEl) statusEl.innerHTML = '<span style="color:#f44336">Erro imagem: ' + e.message + '</span>';
         } finally {
@@ -2981,10 +3096,48 @@
         if (autoRun) releaseRunLock();
         startClashScreenshotFlow._running = false;
         startClashScreenshotFlow._cooldownUntil = Date.now() + 3000;
+        try {
+            if (flowImageGenerated && flowLogContext && getClashSettings(flowLogContext.sport).sendDiagnosticLogs) {
+                const entries = zoeLogBuffer.filter(entry => entry.seq > flowLogStartSeq);
+                void sendClashDiagnosticLog({
+                    version: SCRIPT_VERSION,
+                    timestamp: new Date().toISOString(),
+                    username: detectCurrentUser() || '',
+                    sport: flowLogContext.sport,
+                    ourId: flowLogContext.ourId,
+                    rivalId: flowLogContext.rivalId,
+                    autoRun: flowLogContext.autoRun,
+                    pageInfo: flowLogContext.pageInfo,
+                    language: getLanguage(),
+                    image: {
+                        generated: flowImageGenerated,
+                        plain: !!flowImageUrls.plain,
+                        stats: !!flowImageUrls.stats,
+                        urlPlain: flowImageUrls.plain || null,
+                        urlStats: flowImageUrls.stats || null
+                    },
+                    guestbookPosted: flowGuestbookPosted,
+                    chat: flowChatResult,
+                    error: flowError,
+                    timings: flowTimings,
+                    userAgent: navigator.userAgent,
+                    pageUrl: location.href,
+                    entries: entries
+                });
+            }
+        } catch(e) {
+            console.warn('ZOE Log: erro ao preparar diagnóstico:', e.message);
+        }
     }
     }
 
     // --- Clash UI ---
+
+    function getChatTestTarget() {
+        const current = (typeof detectCurrentUser === 'function' ? detectCurrentUser() : '') || '';
+        const isMarl = current.trim().toLowerCase() === 'marl_man_boro';
+        return isMarl ? { uid: '6921358', name: 'ruisimoes' } : { uid: '1313869', name: 'marl_man_boro' };
+    }
 
     function injectClashIcon() {
         if (!window.location.search.includes('sub=clash')) return;
@@ -3010,10 +3163,20 @@
             gear.onmouseenter = () => { gear.style.filter = 'none'; };
             gear.onmouseleave = () => { gear.style.filter = needsRed ? 'none' : 'grayscale(100%)'; };
             gear.onclick = (e) => { e.stopPropagation(); showClashSettings(sport); };
+            const testBtn = document.createElement('span');
+            testBtn.id = 'zoe-chat-test-icon';
+            testBtn.textContent = '💬';
+            const testTarget = getChatTestTarget();
+            testBtn.title = 'Teste Chat (temporário) — envia "Teste Chat" para ' + testTarget.name + ' (uid ' + testTarget.uid + ')';
+            testBtn.style.cssText = 'cursor:pointer;font-size:16px;margin:0 3px;filter:grayscale(100%);transition:filter 0.2s';
+            testBtn.onmouseenter = () => { testBtn.style.filter = 'none'; };
+            testBtn.onmouseleave = () => { testBtn.style.filter = 'grayscale(100%)'; };
+            testBtn.onclick = (e) => { e.stopPropagation(); runSingleChatTest(); };
             const btnRow = document.createElement('div');
             btnRow.style.cssText = 'text-align:center;margin-top:2px';
             btnRow.appendChild(icon);
             btnRow.appendChild(gear);
+            btnRow.appendChild(testBtn);
             const firstBr = deadline.querySelector('br');
             if (firstBr) {
                 firstBr.after(btnRow);
@@ -3299,6 +3462,8 @@ logTiming('Imagem gerada');
         html += ' <span style="font-size:11px;color:#888">' + t('hoursBeforeNextRound') + '</span>';
         html += '<textarea id="zoe-cfg-autoMessageTemplate" style="display:none">' + (s.autoMessageTemplate || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;') + '</textarea>';
         html += '</div>';
+
+        html += '<label id="zoe-cfg-sendLogs-label" title="' + t('sendDiagnosticLogsTooltip') + '" style="display:flex;align-items:center;gap:6px;margin-bottom:12px;font-size:12px;color:#eee;cursor:pointer;white-space:nowrap"><input type="checkbox" id="zoe-cfg-sendDiagnosticLogs"' + (s.sendDiagnosticLogs ? ' checked' : '') + ' style="cursor:pointer;width:16px;height:16px;flex-shrink:0">' + t('sendDiagnosticLogs') + '</label>';
 
         html += '<div style="display:flex;justify-content:flex-end;align-items:center;gap:12px"><a href="https://www.managerzone.com/?p=profile&uid=6921358&sport=soccer" target="_blank" id="zoe-cfg-sugestao-link" style="color:#f44336;font-size:12px;text-decoration:none;cursor:pointer;margin-right:auto">' + t('suggestions') + '</a><button id="zoe-cfg-version-history" style="background:#555;color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px">' + t('versionHistory') + '</button><button id="zoe-cfg-check-updates" style="background:#555;color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px">' + t('checkUpdates') + '</button><button id="zoe-clash-cfg-save" style="background:' + accent + ';color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px">' + t('save') + '</button></div>';
 
@@ -3613,7 +3778,8 @@ logTiming('Imagem gerada');
                 autoMessageBefore: Math.min(Math.max(parseInt(panel.querySelector('#zoe-cfg-autoMessageBefore').value, 10) || 24, 12), 48),
                 autoMessageTemplate: panel.querySelector('#zoe-cfg-autoMessageTemplate').value,
                 chatToManagers: panel.querySelector('#zoe-cfg-chatToManagers').checked,
-                chatTemplate: panel.querySelector('#zoe-cfg-chatTemplate').value
+                chatTemplate: panel.querySelector('#zoe-cfg-chatTemplate').value,
+                sendDiagnosticLogs: panel.querySelector('#zoe-cfg-sendDiagnosticLogs').checked
             };
             saveClashConfig(sport, newCfg);
             console.log('ZOE Clash config guardada (' + sport + '):', JSON.stringify(newCfg));
@@ -4545,6 +4711,10 @@ logTiming('Imagem gerada');
             });
         });
         let ourMembers = [];
+        try {
+            const titleMatch = fedHtml ? fedHtml.match(/<title[^>]*>([\s\S]*?)<\/title>/i) : null;
+            console.log('ZOE AutoMsg: ?p=federations length=' + (fedHtml ? fedHtml.length : 0) + ' | hasTable=' + (fedHtml ? /id="federation_clash_members_list"/i.test(fedHtml) : false) + ' | data-user-id=' + (fedHtml ? (fedHtml.match(/data-user-id="/g) || []).length : 0) + ' | title=' + (titleMatch ? titleMatch[1].replace(/\s+/g, ' ').trim().slice(0, 120) : ''));
+        } catch(e) {}
         if (fedHtml && fedHtml.length > 200) {
             ourMembers = parseFederationMembersList(fedHtml);
             console.log('ZOE AutoMsg: membros da federação (?p=federations) = ' + ourMembers.length);
@@ -4564,7 +4734,10 @@ logTiming('Imagem gerada');
             }
         }
         if (!ourMembers.length) {
-            console.warn('ZOE AutoMsg: nenhum membro encontrado');
+            console.warn('ZOE AutoMsg: nenhum membro encontrado | fedHtmlLen=' + (fedHtml ? fedHtml.length : 0) + ' | fedTable=' + (fedHtml ? /id="federation_clash_members_list"/i.test(fedHtml) : false) + ' | clashHtmlLen=' + (currentOurHtml ? currentOurHtml.length : 0));
+            let fedSnippet = '';
+            try { fedSnippet = (fedHtml || '').replace(/\s+/g, ' ').slice(0, 1000); } catch(e) {}
+            console.warn('ZOE AutoMsg: snippet ?p=federations: ' + fedSnippet);
             return null;
         }
         // Buscar o HTML do Clash para verificar quem já jogou
@@ -4595,23 +4768,31 @@ logTiming('Imagem gerada');
         if (!html) return members;
         const tableRe = /<table[^>]*id="federation_clash_members_list"[^>]*>([\s\S]*?)<\/table>/i;
         const tm = html.match(tableRe);
-        if (!tm) return members;
+        if (!tm) {
+            console.warn('ZOE AutoMsg: parseFederationMembersList — tabela #federation_clash_members_list não encontrada');
+            return members;
+        }
         const trRe = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
         let rm;
+        let rowCount = 0, skippedNoUid = 0, skippedNoName = 0, skippedDup = 0;
         while ((rm = trRe.exec(tm[1])) !== null) {
+            rowCount++;
             const row = rm[1];
             const uidMatch = row.match(/data-user-id="(\d+)"/);
-            if (!uidMatch) continue;
+            if (!uidMatch) { skippedNoUid++; continue; }
             const nameMatch = row.match(/<a[^>]*href="[^"]*p=profile[^"]*uid=\d+[^"]*"[^>]*>([\s\S]*?)<\/a>/i);
             const name = nameMatch ? nameMatch[1].replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim() : '';
-            if (!name) continue;
-            if (members.find(x => x.uid === uidMatch[1])) continue;
+            if (!name) { skippedNoName++; continue; }
+            if (members.find(x => x.uid === uidMatch[1])) { skippedDup++; continue; }
             // o badge de membro principal conta apenas se aparecer antes do link do nome
             const nm = row.indexOf('<a');
             const isMain = nm >= 0 && /superuser-icon|fa-universal-access/i.test(row.substring(0, nm));
             const teamMatch = row.match(/<a[^>]*class="team-name"[^>]*>([\s\S]*?)<\/a>/i);
             const team = teamMatch ? teamMatch[1].replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim() : '';
             members.push({ uid: uidMatch[1], name: name, team: team, isMain: isMain, played: false });
+        }
+        if (rowCount && !members.length) {
+            console.warn('ZOE AutoMsg: parseFederationMembersList — rows=' + rowCount + ' | semUid=' + skippedNoUid + ' | semNome=' + skippedNoName + ' | duplicados=' + skippedDup);
         }
         return members;
     }
@@ -4620,19 +4801,26 @@ logTiming('Imagem gerada');
         // deteção idêntica à Auto-Mensagem: ?p=federations&sub=clash (sem &prev=)
         // com a nossa federação e a rival; se nenhuma equipa for detetada,
         // fallback para ?p=federations e a tabela #federation_clash_members_list
+        const t0 = Date.now();
+        console.log('ZOE Chat: fetchChatTargetManagers START | sport=' + sport + ' | nextRound=' + (nextRound ? nextRound.round : 'null') + ' | visibility=' + document.visibilityState);
         let members = null;
         try {
+            const tc = Date.now();
             const clash = await fetchClashMissingManagers(sport, nextRound);
+            console.log('ZOE Chat: fetchClashMissingManagers em ' + (Date.now() - tc) + 'ms → all=' + (clash && clash.all ? clash.all.length : 0) + ' | missing=' + (clash && clash.missing ? clash.missing.length : 0) + (clash && clash.all ? ' | ' + JSON.stringify(clash.all.slice(0, 20).map(m => ({ uid: m.uid, name: m.name, team: m.team, isMain: !!m.isMain, played: !!m.played }))) : ''));
             if (clash && clash.all && clash.all.length) {
                 members = clash.all;
                 console.log('ZOE Chat: managers detetados via sub=clash = ' + members.length);
+            } else {
+                console.log('ZOE Chat: sub=clash não devolveu membros (all=' + (clash && clash.all ? clash.all.length : 0) + ', missing=' + (clash && clash.missing ? clash.missing.length : 0) + ')');
             }
         } catch(e) {
-            console.warn('ZOE Chat: erro na deteção via sub=clash:', e.message);
+            console.warn('ZOE Chat: erro na deteção via sub=clash: ' + (e && e.stack ? e.stack : e));
         }
         if (!members || !members.length) {
             console.log('ZOE Chat: nenhuma equipa detetada em sub=clash, fallback para ?p=federations...');
             const url = 'https://www.managerzone.com/?p=federations&changesport=' + sport + '&_nocache=' + Date.now();
+            console.log('ZOE Chat: fallback GET ' + url);
             const html = await new Promise((resolve) => {
                 GM_xmlhttpRequest({
                     method: 'GET', url,
@@ -4642,34 +4830,107 @@ logTiming('Imagem gerada');
                     onerror: () => resolve(''), ontimeout: () => resolve('')
                 });
             });
+            console.log('ZOE Chat: fallback resposta length=' + (html ? html.length : 0));
             if (!html || html.length < 200) {
                 console.warn('ZOE Chat: resposta vazia/curta de ?p=federations (' + (html ? html.length : 0) + ' bytes)');
                 return null;
             }
+            let tableInfo = 'sem tabela';
+            try {
+                const hasTable = /id="federation_clash_members_list"/i.test(html);
+                const uidCount = (html.match(/data-user-id="/g) || []).length;
+                const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+                tableInfo = 'hasTable=' + hasTable + ' | data-user-id=' + uidCount + ' | title=' + (titleMatch ? titleMatch[1].replace(/\s+/g, ' ').trim().slice(0, 100) : '');
+            } catch(e) {}
             members = parseFederationMembersList(html);
-            console.log('ZOE Chat: managers detetados via ?p=federations (#federation_clash_members_list) = ' + members.length);
-            if (!members.length) return null;
+            console.log('ZOE Chat: managers detetados via ?p=federations = ' + members.length + ' | ' + tableInfo + ' | ' + JSON.stringify(members.slice(0, 20).map(m => ({ uid: m.uid, name: m.name, team: m.team, isMain: !!m.isMain }))));
+            if (!members.length) {
+                let snippet = '';
+                try { snippet = html.replace(/\s+/g, ' ').slice(0, 800); } catch(e) {}
+                console.warn('ZOE Chat: fallback sem membros | snippet=' + snippet);
+                return null;
+            }
         }
+        console.log('ZOE Chat: fetchChatTargetManagers FIM em ' + (Date.now() - t0) + 'ms | total=' + members.length);
         return members;
     }
 
     let zoeMsgFrame = null;
     function getMsgFrame() {
-        if (zoeMsgFrame && zoeMsgFrame.parentNode) return zoeMsgFrame;
+        if (zoeMsgFrame && zoeMsgFrame.parentNode) {
+            console.log('ZOE AutoMsg: a reutilizar iframe de mensagens | src=' + String(zoeMsgFrame.src || '').slice(0, 160));
+            return zoeMsgFrame;
+        }
         const f = document.createElement('iframe');
         f.id = 'zoe-amsg-frame';
         f.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1200px;height:800px;border:none;';
         document.body.appendChild(f);
         zoeMsgFrame = f;
+        f.addEventListener('load', function() { hookFrameDiagnostics(f); });
+        console.log('ZOE AutoMsg: iframe de mensagens criado | id=' + f.id);
         return f;
+    }
+    function hookFrameDiagnostics(frame) {
+        try {
+            const w = frame.contentWindow;
+            const d = frame.contentDocument;
+            if (!w || !d) return;
+            if (d.__zoeFrameDiagHooked) return;
+            d.__zoeFrameDiagHooked = true;
+            try {
+                w.addEventListener('error', function(ev) {
+                    try {
+                        const target = ev && ev.target;
+                        const src = target && (target.src || target.href) ? ' | target=' + String(target.src || target.href).slice(0, 180) : '';
+                        const stack = ev && ev.error && ev.error.stack ? ' | stack=' + String(ev.error.stack).slice(0, 1200) : '';
+                        const loc = ev && ev.filename ? ' | ' + ev.filename + ':' + ev.lineno + ':' + ev.colno : '';
+                        console.error('ZOE Frame JS error: ' + (ev && ev.message ? ev.message : 'resource error') + loc + src + stack);
+                    } catch(e) {}
+                }, true);
+            } catch(e) {}
+            try {
+                w.addEventListener('unhandledrejection', function(ev) {
+                    try {
+                        const r = ev && ev.reason;
+                        const text = r && r.stack ? r.stack : (r && r.message ? r.message : zoeFormatLogArg(r));
+                        console.error('ZOE Frame unhandledrejection: ' + String(text).slice(0, 1200));
+                    } catch(e) {}
+                });
+            } catch(e) {}
+            ['error', 'warn'].forEach(function(level) {
+                try {
+                    const orig = w.console && w.console[level];
+                    if (typeof orig !== 'function' || orig.__zoeFrameWrapped) return;
+                    const wrapped = function() {
+                        try {
+                            const msg = Array.prototype.slice.call(arguments).map(zoeFormatLogArg).join(' ');
+                            console[level]('ZOE Frame console.' + level + ': ' + msg);
+                        } catch(e) {}
+                        return orig.apply(w.console, arguments);
+                    };
+                    wrapped.__zoeFrameWrapped = true;
+                    w.console[level] = wrapped;
+                } catch(e) {}
+            });
+            console.log('ZOE Chat: hooks de diagnóstico do iframe instalados | url=' + String((w.location && w.location.href) || '').slice(0, 160));
+        } catch(e) {
+            console.warn('ZOE Chat: falha ao instalar hooks do iframe: ' + (e && e.message ? e.message : e));
+        }
     }
     function loadInFrame(frame, url) {
         return new Promise(resolve => {
+            const t0 = Date.now();
             let done = false;
-            const finish = () => { if (!done) { done = true; resolve(); } };
-            frame.onload = finish;
-            try { frame.src = url; } catch(e) { finish(); }
-            setTimeout(finish, 20000);
+            const finish = (reason) => {
+                if (done) return;
+                done = true;
+                hookFrameDiagnostics(frame);
+                console.log('ZOE Chat: loadInFrame ' + reason + ' em ' + (Date.now() - t0) + 'ms | url=' + String(url).slice(0, 160) + ' | ' + zoeChatFrameState(frame, null));
+                resolve();
+            };
+            frame.onload = () => finish('onload');
+            try { frame.src = url; } catch(e) { finish('erro ao definir src: ' + (e && e.message ? e.message : e)); return; }
+            setTimeout(() => { if (!done) finish('TIMEOUT 20s'); }, 20000);
         });
     }
     function waitForInFrame(frame, fn, timeout, interval) {
@@ -4690,19 +4951,143 @@ logTiming('Imagem gerada');
             const evt = frame.contentDocument.createEvent('MouseEvents');
             evt.initMouseEvent('click', true, true, frame.contentWindow, 0, 0, 0, 0, 0, false, false, false, false, 0, null);
             el.dispatchEvent(evt);
+            return true;
         } catch(e) {
-            try { el.click(); } catch(e2) {}
+            try { el.click(); return true; } catch(e2) {
+                console.warn('ZOE clickInFrame: falha no clique:', e2 && e2.message ? e2.message : e2);
+                return false;
+            }
         }
     }
-    async function sendPrivateMessage(sport, receiverName, receiverUid, body) {
+
+    function zoeChatFrameState(frame, uid) {
+        const out = {};
+        try {
+            const w = frame.contentWindow;
+            const d = frame.contentDocument;
+            out.iframe = {
+                id: frame.id || '',
+                src: String(frame.src || '').slice(0, 180),
+                readyState: d ? d.readyState : null,
+                url: '',
+                title: d ? String(d.title || '').slice(0, 100) : '',
+                bodyLen: d && d.body ? d.body.innerHTML.length : 0
+            };
+            try { out.iframe.url = w && w.location ? String(w.location.href).slice(0, 180) : ''; }
+            catch(e) { out.iframe.url = 'cross-origin'; }
+            out.page = {
+                visibility: document.visibilityState,
+                topFrames: document.querySelectorAll('iframe').length,
+                active: document.activeElement ? (document.activeElement.tagName + (document.activeElement.id ? '#' + document.activeElement.id : '')) : null
+            };
+            if (d) {
+                let loginText = null;
+                try {
+                    const trs = d.querySelectorAll('table tr');
+                    for (const tr of trs) {
+                        const cells = tr.querySelectorAll('td, th');
+                        if (cells.length >= 2 && /^login:?$/i.test(String(cells[0].textContent || '').trim())) {
+                            loginText = String(cells[1].textContent || '').trim().slice(0, 60);
+                            break;
+                        }
+                    }
+                } catch(e) {}
+                out.dom = {
+                    loginInputs: d.querySelectorAll('input[type="password"], input[name="login"], input[name="username"]').length,
+                    loginText: loginText,
+                    messengerLinks: d.querySelectorAll('a.messenger-link').length,
+                    wrapper: !!d.getElementById('messenger-dialog-wrapper'),
+                    dialogs: d.querySelectorAll('.messenger-dialog').length,
+                    dialogIds: Array.prototype.slice.call(d.querySelectorAll('.messenger-dialog'), 0, 5).map(function(x) { return x.id + (x.classList.contains('minimized') ? ':min' : ''); }),
+                    inputs: Array.prototype.slice.call(d.querySelectorAll('[id^="message-input-"]'), 0, 5).map(function(x) { return x.id + (x.getClientRects().length ? ':vis' : ':hid'); }),
+                    sendButtons: d.querySelectorAll('.messenger-send-button').length,
+                    youRows: d.querySelectorAll('.messenger-row.you').length
+                };
+                if (uid) {
+                    const dlg = d.getElementById('messenger-dialog-' + uid);
+                    const inp = d.getElementById('message-input-' + uid);
+                    const btn = dlg ? dlg.querySelector('.messenger-send-button') : null;
+                    out.target = {
+                        dialog: !!dlg,
+                        dialogClass: dlg ? String(dlg.className || '') : null,
+                        dialogVisible: !!(dlg && dlg.getClientRects().length),
+                        minimized: !!(dlg && dlg.classList.contains('minimized')),
+                        blocked: !!(dlg && dlg.classList.contains('blocked')),
+                        input: !!inp,
+                        inputVisible: !!(inp && inp.getClientRects().length),
+                        inputLen: inp ? String(inp.innerText || inp.textContent || '').length : null,
+                        inputText: inp ? String(inp.innerText || inp.textContent || '').replace(/\s+/g, ' ').slice(0, 80) : null,
+                        btn: !!btn,
+                        btnClass: btn ? String(btn.className || '') : null,
+                        btnDisabled: btn ? (btn.disabled === true || btn.getAttribute('disabled') !== null) : null,
+                        rowsYou: dlg ? dlg.querySelectorAll('.messenger-row.you').length : null,
+                        rowsAll: dlg ? dlg.querySelectorAll('.messenger-row').length : null
+                    };
+                }
+                const m = w && w.mz && w.mz.messenger;
+                out.mz = {
+                    hasMz: !!(w && w.mz),
+                    hasMessenger: !!m,
+                    messengerType: m ? typeof m : null,
+                    keys: m && typeof m === 'object' ? Object.keys(m).slice(0, 15) : null,
+                    eventsBound: m ? !!m.eventsBound : null,
+                    hasDialog: !!(m && typeof m.dialog === 'function')
+                };
+            }
+        } catch(e) {
+            out.error = e && e.message ? e.message : String(e);
+        }
+        try {
+            const s = JSON.stringify(out);
+            return s.length > 2400 ? s.slice(0, 2400) + '…' : s;
+        } catch(e) { return '{"error":"state stringify"}'; }
+    }
+
+    async function waitForInFrameLogged(frame, fn, timeout, interval, label, uid) {
+        const start = Date.now();
+        let ticks = 0;
+        let lastErr = '';
+        let lastProgress = 0;
+        const val = await waitForInFrame(frame, (f) => {
+            ticks++;
+            try {
+                const v = fn(f);
+                if (v) return v;
+            } catch(e) {
+                lastErr = e && e.message ? e.message : String(e);
+            }
+            const elapsed = Date.now() - start;
+            if (timeout >= 15000 && elapsed - lastProgress >= 8000) {
+                lastProgress = elapsed;
+                console.log('ZOE Chat: ' + label + ' — ainda à espera (' + Math.round(elapsed / 1000) + 's/' + Math.round(timeout / 1000) + 's) | ' + zoeChatFrameState(frame, uid));
+            }
+            return null;
+        }, timeout, interval);
+        const elapsed = Date.now() - start;
+        if (val) {
+            console.log('ZOE Chat: ' + label + ' — OK em ' + elapsed + 'ms (' + ticks + ' tentativas)');
+        } else {
+            console.warn('ZOE Chat: ' + label + ' — TIMEOUT em ' + elapsed + 'ms (' + ticks + ' tentativas)' + (lastErr ? ' | último erro: ' + lastErr : '') + ' | ' + zoeChatFrameState(frame, uid));
+        }
+        return val;
+    }
+
+    async function sendPrivateMessage(sport, receiverName, receiverUid, body, debugCtx) {
+        const dbg = debugCtx || {};
+        const tag = 'ZOE AutoMsg' + (dbg.runId ? '[' + dbg.runId + (dbg.index ? ' ' + dbg.index + '/' + dbg.total : '') + ']' : '') + ':';
+        const t0 = Date.now();
         const frame = getMsgFrame();
         const uid = String(receiverUid);
         const profileUrl = 'https://www.managerzone.com/?p=profile&uid=' + uid + '&_nocache=' + Date.now();
-        console.log('ZOE AutoMsg: a abrir perfil de', receiverName, '(uid ' + uid + ')');
+        const bodyText = String(body || '');
+        const bodyLinesPreview = bodyText.split(/\r?\n/).slice(0, 3).map(l => l.slice(0, 100));
+        console.log(tag, 'sendPrivateMessage START | sport=' + sport + ' | receiver=' + receiverName + ' | uid=' + uid + ' | bodyLen=' + bodyText.length + ' | bodyLines=' + bodyLinesPreview.length + ' | preview=' + JSON.stringify(bodyLinesPreview) + ' | frameSrc=' + String(frame.src || '').slice(0, 140));
+        console.log(tag, 'estado inicial | ' + zoeChatFrameState(frame, uid));
         await loadInFrame(frame, profileUrl);
+        console.log(tag, 'perfil carregado em ' + (Date.now() - t0) + 'ms | ' + zoeChatFrameState(frame, uid));
         const cleanLabel = (txt) => String(txt || '').replace(/[:：\s]+$/, '').trim().toLowerCase();
         const loginLabels = ['login', 'username', 'utilizador', 'user', 'nome de utilizador', 'nickname'];
-        const profileLogin = await waitForInFrame(frame, (f) => {
+        const profileLogin = await waitForInFrameLogged(frame, (f) => {
             const d = f.contentDocument;
             if (!d) return null;
             const rows = d.querySelectorAll('table tr');
@@ -4737,13 +5122,13 @@ logTiming('Imagem gerada');
                 }
             }
             return null;
-        }, 15000);
+        }, 15000, 300, tag + ' campo Login', uid);
         if (profileLogin && profileLogin.toLowerCase() !== String(receiverName || '').trim().toLowerCase()) {
-            console.error('ZOE AutoMsg: o perfil abriu para "' + profileLogin + '", mas esperava-se "' + receiverName + '" (uid ' + uid + '); a mensagem NÃO foi enviada');
+            console.error(tag, 'PERFIL ERRADO | abriu para "' + profileLogin + '", esperava-se "' + receiverName + '" (uid ' + uid + ') | ' + zoeChatFrameState(frame, uid));
             return false;
         }
         if (profileLogin) {
-            console.log('ZOE AutoMsg: login do perfil confirmado = ' + profileLogin + ' (match com *user*)');
+            console.log(tag, 'login do perfil confirmado = ' + profileLogin + ' (match com *user*)');
         } else {
             let profileSnippet = '';
             try {
@@ -4753,9 +5138,16 @@ logTiming('Imagem gerada');
                 const table = d && d.querySelector('table');
                 profileSnippet = (title ? 'TITLE: ' + title + ' | ' : '') + (h1 ? 'H1: ' + (h1.textContent || '').trim() + ' | ' : '') + (table ? table.outerHTML.substring(0, 1500) : (d && d.body ? d.body.innerHTML.substring(0, 900) : ''));
             } catch(e) {}
-            console.warn('ZOE AutoMsg: campo Login não encontrado no perfil de ' + receiverName + ' (uid ' + uid + '), a validar pelo link de mensagens. Snippet:', profileSnippet);
+            console.warn(tag, 'campo Login não encontrado no perfil de ' + receiverName + ' (uid ' + uid + '), a validar pelo link de mensagens | ' + zoeChatFrameState(frame, uid));
+            if (profileSnippet) console.warn(tag, 'campo Login não encontrado — snippet | perfil=' + receiverName + ' | uid=' + uid + ' | ' + profileSnippet);
         }
-        const link = await waitForInFrame(frame, (f) => {
+        let linkCandidates = [];
+        try {
+            const d = frame.contentDocument;
+            linkCandidates = Array.prototype.slice.call(d.querySelectorAll('a.messenger-link, a[href*="p=messenger"], a[href*="p=messages"]'), 0, 10).map(function(a) { return String(a.getAttribute('href') || '').slice(0, 180); });
+        } catch(e) {}
+        console.log(tag, 'links de mensagens no perfil (' + linkCandidates.length + '): ' + JSON.stringify(linkCandidates));
+        const link = await waitForInFrameLogged(frame, (f) => {
             const d = f.contentDocument;
             if (!d) return null;
             return d.querySelector('a.messenger-link[href*="uid=' + uid + '"]') ||
@@ -4764,7 +5156,7 @@ logTiming('Imagem gerada');
                    d.querySelector('a[href*="p=messages"][href*="uid=' + uid + '"]') ||
                    d.querySelector('a[href*="p=messenger"]') ||
                    d.querySelector('a[href*="p=messages"]');
-        }, 12000);
+        }, 12000, 300, tag + ' link de mensagens', uid);
         if (!link) {
             let linkSnippet = '';
             try {
@@ -4776,66 +5168,182 @@ logTiming('Imagem gerada');
                     if (!linkSnippet) linkSnippet = body.innerHTML.substring(0, 1000);
                 }
             } catch(e) {}
-            console.error('ZOE AutoMsg: link de mensagens não encontrado no perfil de ' + receiverName + '. Links:', linkSnippet);
+            console.error(tag, 'LINK DE MENSAGENS NÃO ENCONTRADO | perfil=' + receiverName + ' | uid=' + uid + ' | ' + zoeChatFrameState(frame, uid));
+            if (linkSnippet) console.error(tag, 'LINK DE MENSAGENS NÃO ENCONTRADO — links/snippet | perfil=' + receiverName + ' | uid=' + uid + ' | ' + linkSnippet);
             return false;
         }
         const href = link.getAttribute('href') || '';
+        console.log(tag, 'link escolhido: ' + String(href).slice(0, 200) + ' | onclick=' + String(link.getAttribute('onclick') || '').slice(0, 160) + ' | outerHTML=' + String(link.outerHTML || '').slice(0, 240));
         if (href.indexOf('uid=' + uid) < 0) {
-            console.error('ZOE AutoMsg: perfil não corresponde ao uid ' + uid + ' (' + href + ')');
+            console.error(tag, 'PERFIL NÃO CORRESPONDE AO UID | esperado=' + uid + ' | href=' + href + ' | ' + zoeChatFrameState(frame, uid));
             return false;
         }
-        clickInFrame(frame, link);
-        const input = await waitForInFrame(frame, (f) => {
+        let initTried = false;
+        let initError = '';
+        const messenger = await waitForInFrameLogged(frame, (f) => {
+            const w = f.contentWindow;
+            const d = f.contentDocument;
+            if (!w || !d || !d.getElementById('messenger-dialog-wrapper')) return null;
+            const m = w.mz && w.mz.messenger;
+            if (!m || typeof m.dialog !== 'function') return null;
+            if (m.eventsBound) return m;
+            if (!initTried) {
+                initTried = true;
+                try {
+                    m.initialize();
+                    console.log(tag, 'mz.messenger.initialize() forçado para ' + receiverName);
+                } catch(e) {
+                    initError = e && e.message ? e.message : String(e);
+                    console.warn(tag, 'falha ao forçar initialize() do messenger: ' + initError);
+                }
+            }
+            return m.eventsBound ? m : null;
+        }, 30000, 300, tag + ' mz.messenger pronto', uid);
+        console.log(tag, 'estado após espera do messenger | initTried=' + initTried + ' | initError=' + (initError || 'none') + ' | ' + zoeChatFrameState(frame, uid));
+        let dialogOpened = false;
+        let messengerApi = null;
+        try {
+            const w = frame.contentWindow;
+            messengerApi = w.mz && w.mz.messenger;
+        } catch(e) {}
+        if (!messengerApi) messengerApi = messenger;
+        const canDialog = !!(messengerApi && typeof messengerApi.dialog === 'function');
+        const hasWrapper = !!(frame.contentDocument && frame.contentDocument.getElementById('messenger-dialog-wrapper'));
+        console.log(tag, 'API messenger | canDialog=' + canDialog + ' | eventsBound=' + !!(messengerApi && messengerApi.eventsBound) + ' | wrapper=' + hasWrapper + ' | hasMessengerObj=' + !!messenger);
+        if (canDialog && hasWrapper) {
+            try {
+                const dialogReturn = messengerApi.dialog(uid);
+                dialogOpened = true;
+                console.log(tag, 'diálogo aberto via mz.messenger.dialog(' + uid + ') | retorno=' + String(dialogReturn).slice(0, 80));
+            } catch(e) {
+                console.warn(tag, 'falha ao abrir diálogo diretamente: ' + (e && e.stack ? e.stack : e));
+            }
+        }
+        if (!dialogOpened) {
+            const clicked = clickInFrame(frame, link);
+            console.log(tag, 'fallback clique no link do messenger | resultado=' + clicked + ' | ' + zoeChatFrameState(frame, uid));
+        }
+        const input = await waitForInFrameLogged(frame, (f) => {
             const d = f.contentDocument;
             if (!d) return null;
             const el = d.getElementById('message-input-' + uid);
-            if (el && d.querySelector('.messenger-dialog.active')) return el;
-            return null;
-        }, 15000);
+            const dlg = d.getElementById('messenger-dialog-' + uid);
+            if (!el || !dlg) return null;
+            if (dlg.classList.contains('minimized')) {
+                const header = dlg.querySelector('.messenger-dialog-header');
+                if (header) clickInFrame(f, header);
+                return null;
+            }
+            if (el.getClientRects().length === 0) return null;
+            return el;
+        }, 45000, 300, tag + ' caixa de mensagem', uid);
         if (!input) {
-            console.error('ZOE AutoMsg: caixa de mensagem não apareceu para ' + receiverName);
+            let frameInfo = '';
+            let dlgInfo = '';
+            try {
+                const w = frame.contentWindow;
+                const d = frame.contentDocument;
+                frameInfo = ' (url: ' + w.location.href + ', dialogs: ' + d.querySelectorAll('.messenger-dialog').length + ', inputs: ' + d.querySelectorAll('[id^="message-input-"]').length + ', eventsBound: ' + !!(w.mz && w.mz.messenger && w.mz.messenger.eventsBound) + ')';
+                const dlg = d.getElementById('messenger-dialog-' + uid);
+                if (dlg) {
+                    dlgInfo = ' | dialogClass="' + String(dlg.className || '') + '" | dialogText="' + String(dlg.innerText || '').replace(/\s+/g, ' ').slice(-700) + '"';
+                } else if (d.body) {
+                    dlgInfo = ' | bodySnippet="' + String(d.body.innerText || '').replace(/\s+/g, ' ').slice(-700) + '"';
+                }
+            } catch(e) {}
+            console.error(tag, 'CAIXA DE MENSAGEM NÃO APARECEU | receiver=' + receiverName + ' | uid=' + uid + frameInfo + ' | ' + zoeChatFrameState(frame, uid));
+            if (dlgInfo) console.error(tag, 'CAIXA DE MENSAGEM NÃO APARECEU — detalhe | receiver=' + receiverName + ' | uid=' + uid + dlgInfo);
             return false;
         }
         input.focus();
+        console.log(tag, 'input encontrado | tag=' + input.tagName + ' | class=' + String(input.className || '') + ' | contenteditable=' + String(input.getAttribute('contenteditable')) + ' | rects=' + input.getClientRects().length + ' | textLen=' + String(input.innerText || input.textContent || '').length);
+        try {
+            const active = frame.contentDocument.activeElement;
+            console.log(tag, 'input.focus() | activeElement=' + (active ? (active.tagName + (active.id ? '#' + active.id : '')) : 'null'));
+        } catch(e) {}
         const lines = String(body || '').split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
         const linesToSend = lines.length > 0 ? lines : [String(body || '').trim()];
         let sentCount = 0;
-        let beforeCount = frame.contentDocument.querySelectorAll('.messenger-dialog.active .messenger-row.you').length;
-        for (const line of linesToSend) {
+        let beforeCount = frame.contentDocument.querySelectorAll('#messenger-dialog-' + uid + ' .messenger-row.you').length;
+        let dialogRowsAll = 0;
+        try { dialogRowsAll = frame.contentDocument.querySelectorAll('#messenger-dialog-' + uid + ' .messenger-row').length; } catch(e) {}
+        console.log(tag, 'linhas a enviar=' + linesToSend.length + ' | beforeCount=' + beforeCount + ' | dialogRows=' + dialogRowsAll);
+        for (let li = 0; li < linesToSend.length; li++) {
+            const line = linesToSend[li];
             input.focus();
             input.innerText = line;
+            let inputState = '';
+            try {
+                inputState = 'innerTextLen=' + String(input.innerText || '').length + ' | textLen=' + String(input.textContent || '').length + ' | valueLen=' + String(input.value || '').length + ' | htmlLen=' + String(input.innerHTML || '').length;
+            } catch(e) {
+                inputState = 'inputStateError=' + (e && e.message ? e.message : e);
+            }
             try {
                 const evt = frame.contentDocument.createEvent('Event');
                 evt.initEvent('input', true, false);
                 input.dispatchEvent(evt);
             } catch(e) {}
-            const sendBtn = frame.contentDocument.querySelector('.messenger-dialog.active .messenger-send-button');
+            const sendBtn = frame.contentDocument.querySelector('#messenger-dialog-' + uid + ' .messenger-send-button');
             if (!sendBtn) {
-                console.error('ZOE AutoMsg: botão de envio não encontrado para ' + receiverName + ' (linha: ' + line.substring(0, 40) + ')');
+                let dlgHtml = '';
+                try {
+                    const dlg = frame.contentDocument.getElementById('messenger-dialog-' + uid);
+                    dlgHtml = dlg ? dlg.innerHTML.slice(-1200) : '';
+                } catch(e) {}
+                console.error(tag, 'SEND BUTTON NÃO ENCONTRADO | linha=' + (li + 1) + '/' + linesToSend.length + ' | texto="' + line.substring(0, 80) + '" | ' + zoeChatFrameState(frame, uid));
+                if (dlgHtml) console.error(tag, 'SEND BUTTON NÃO ENCONTRADO — dialogHTML | linha=' + (li + 1) + '/' + linesToSend.length + ' | ' + dlgHtml);
                 return false;
             }
             const first = line.substring(0, 60);
-            clickInFrame(frame, sendBtn);
-            const sent = await waitForInFrame(frame, (f) => {
+            let btnState = '';
+            try {
+                btnState = 'class=' + String(sendBtn.className || '') + ' | disabled=' + (sendBtn.disabled === true || sendBtn.getAttribute('disabled') !== null) + ' | rects=' + sendBtn.getClientRects().length + ' | html=' + String(sendBtn.outerHTML || '').slice(0, 160);
+            } catch(e) {
+                btnState = 'btnStateError=' + (e && e.message ? e.message : e);
+            }
+            console.log(tag, 'linha ' + (li + 1) + '/' + linesToSend.length + ' | len=' + line.length + ' | first="' + first + '" | input: ' + inputState + ' | btn: ' + btnState + ' | rowsAntes=' + beforeCount);
+            const clicked = clickInFrame(frame, sendBtn);
+            console.log(tag, 'clique send=' + clicked + ' | rowsAntes=' + beforeCount);
+            const sent = await waitForInFrameLogged(frame, (f) => {
                 const d = f.contentDocument;
                 if (!d) return null;
-                const rows = d.querySelectorAll('.messenger-dialog.active .messenger-row.you');
+                const rows = d.querySelectorAll('#messenger-dialog-' + uid + ' .messenger-row.you');
                 if (rows.length <= beforeCount) return null;
                 for (let i = rows.length - 1; i >= beforeCount; i--) {
                     if (first && (rows[i].textContent || '').indexOf(first) >= 0) return true;
                 }
                 return null;
-            }, 8000);
+            }, 20000, 300, tag + ' confirmação linha ' + (li + 1), uid);
             if (sent) {
-                beforeCount = frame.contentDocument.querySelectorAll('.messenger-dialog.active .messenger-row.you').length;
+                beforeCount = frame.contentDocument.querySelectorAll('#messenger-dialog-' + uid + ' .messenger-row.you').length;
                 sentCount++;
-                console.log('ZOE AutoMsg: linha enviada a ' + receiverName + ': "' + first + (line.length > 60 ? '…' : '') + '"');
+                let lastRowInfo = '';
+                try {
+                    const rows = frame.contentDocument.querySelectorAll('#messenger-dialog-' + uid + ' .messenger-row.you');
+                    const last = rows.length ? rows[rows.length - 1] : null;
+                    if (last) lastRowInfo = ' | lastRowId=' + last.id + ' | lastRowText="' + String(last.textContent || '').replace(/\s+/g, ' ').slice(0, 100) + '"';
+                } catch(e) {}
+                console.log(tag, 'linha ' + (li + 1) + ' CONFIRMADA | rowsAgora=' + beforeCount + lastRowInfo);
             } else {
-                console.warn('ZOE AutoMsg: linha sem confirmação a ' + receiverName + ': "' + first + '"');
+                let dlgText = '', dlgHtml = '', lastRows = '';
+                try {
+                    const dlg = frame.contentDocument.getElementById('messenger-dialog-' + uid);
+                    if (dlg) {
+                        dlgText = String(dlg.innerText || '').replace(/\s+/g, ' ').slice(-900);
+                        dlgHtml = dlg.innerHTML.slice(-600);
+                        const rows = dlg.querySelectorAll('.messenger-row');
+                        lastRows = Array.prototype.slice.call(rows, Math.max(0, rows.length - 3)).map(function(r) {
+                            return (r.id || '?') + '|' + String(r.className || '').replace(/\s+/g, '.') + '|' + String(r.textContent || '').replace(/\s+/g, ' ').slice(0, 90);
+                        }).join(' || ');
+                    }
+                } catch(e) {}
+                console.warn(tag, 'LINHA SEM CONFIRMAÇÃO | linha=' + (li + 1) + '/' + linesToSend.length + ' | texto="' + first + '" | ' + zoeChatFrameState(frame, uid));
+                if (lastRows) console.warn(tag, 'LINHA SEM CONFIRMAÇÃO — últimas rows | linha=' + (li + 1) + '/' + linesToSend.length + ' | ' + lastRows);
+                if (dlgText || dlgHtml) console.warn(tag, 'LINHA SEM CONFIRMAÇÃO — conteúdo | linha=' + (li + 1) + '/' + linesToSend.length + ' | dialogText="' + dlgText + '" | dialogHTML=' + dlgHtml);
                 return false;
             }
         }
-        console.log('ZOE AutoMsg: PM para ' + receiverName + ' — ' + sentCount + '/' + linesToSend.length + ' linhas confirmadas');
+        console.log(tag, 'PM FIM | ' + receiverName + ' — ' + sentCount + '/' + linesToSend.length + ' linhas confirmadas | total=' + (Date.now() - t0) + 'ms');
         return sentCount === linesToSend.length;
     }
 
@@ -4845,10 +5353,13 @@ logTiming('Imagem gerada');
 
         function confirmAutoMessageSend(sport, missing, showDefer, isChat) {
         return new Promise(resolve => {
+            const t0 = Date.now();
             const selfUser = (typeof detectCurrentUser === 'function' && detectCurrentUser()) || '';
+            const beforeSelf = missing.slice();
             if (selfUser) {
                 missing = missing.filter(m => m.name.toLowerCase() !== selfUser.toLowerCase());
             }
+            console.log('ZOE AutoMsg: confirmação START | sport=' + sport + ' | isChat=' + !!isChat + ' | showDefer=' + !!showDefer + ' | visibility=' + document.visibilityState + ' | selfUser=' + (selfUser || '?') + ' | antes=' + beforeSelf.length + ' | depoisSelf=' + missing.length + ' | removidos=' + JSON.stringify(beforeSelf.filter(m => selfUser && m.name.toLowerCase() === selfUser.toLowerCase()).map(m => m.name)) + ' | managers=' + JSON.stringify(missing.map(m => m.name + '#' + m.uid)));
             const doc = document;
             const showModal = () => {
                 const accent = getSportAccent(sport);
@@ -4872,6 +5383,13 @@ logTiming('Imagem gerada');
                 modal.innerHTML += '<div style="display:flex;justify-content:flex-end;align-items:center;gap:8px;flex-wrap:wrap"><button id="zoe-amsg-confirm-cancel" style="background:#555;color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px">' + t('chatConfirmCancel') + '</button>' + (showDefer ? '<button id="zoe-amsg-confirm-defer" style="background:#ff9800;color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px">' + t('chatConfirmDefer') + '</button>' : '') + '<button id="zoe-amsg-confirm-send" style="background:' + accent + ';color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px">' + t('chatConfirmSend') + '</button></div>';
                 overlay.appendChild(modal);
                 doc.body.appendChild(overlay);
+                try {
+                    const cbs = overlay.querySelectorAll('.zoe-amsg-confirm-cb');
+                    const checkedCount = Array.prototype.filter.call(cbs, cb => cb.checked).length;
+                    console.log('ZOE AutoMsg: confirmação MODAL ABERTO | checkboxes=' + cbs.length + ' | checked=' + checkedCount + ' | exclusions=' + JSON.stringify(isChat ? getChatExclusions(sport) : {}) + ' | overlayNoDOM=' + !!doc.body.contains(overlay));
+                } catch(e) {
+                    console.warn('ZOE AutoMsg: erro ao inspecionar modal: ' + (e && e.message ? e.message : e));
+                }
                 let tip = null;
                 const hideTip = () => { if (tip) { tip.remove(); tip = null; } };
                 const showTip = (el) => {
@@ -4885,7 +5403,12 @@ logTiming('Imagem gerada');
                     tip.style.left = Math.min(r.left, window.innerWidth - tip.offsetWidth - 8) + 'px';
                     tip.style.top = (r.bottom + 6) + 'px';
                 };
-                const close = (val) => { hideTip(); overlay.remove(); resolve(val); };
+                const close = (val) => {
+                    console.log('ZOE AutoMsg: confirmação FECHADA | decisão=' + JSON.stringify(val) + ' | duração=' + (Date.now() - t0) + 'ms');
+                    hideTip();
+                    overlay.remove();
+                    resolve(val);
+                };
                 const askCancelConfirm = () => new Promise(resolveC => {
                     const co = doc.createElement('div');
                     co.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;z-index:10000002;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center';
@@ -4902,6 +5425,7 @@ logTiming('Imagem gerada');
                 });
                 overlay.querySelector('#zoe-amsg-confirm-send').onclick = () => {
                     const checked = Array.prototype.filter.call(overlay.querySelectorAll('.zoe-amsg-confirm-cb'), cb => cb.checked).map(cb => cb.value);
+                    console.log('ZOE AutoMsg: confirmação CLIQUE ENVIAR | checked=' + JSON.stringify(checked));
                     if (checked.length === 0) {
                         alert(t('chatSelectManager'));
                         return;
@@ -4909,13 +5433,15 @@ logTiming('Imagem gerada');
                     close(checked);
                 };
                 overlay.querySelector('#zoe-amsg-confirm-cancel').onclick = async () => {
+                    console.log('ZOE AutoMsg: confirmação CLIQUE CANCELAR');
                     const sure = await askCancelConfirm();
+                    console.log('ZOE AutoMsg: confirmação cancelamento confirmado=' + sure);
                     if (sure) close('cancel');
                 };
                 const deferBtn = overlay.querySelector('#zoe-amsg-confirm-defer');
-                if (deferBtn) deferBtn.onclick = () => close('defer');
-                overlay.querySelector('#zoe-amsg-confirm-x').onclick = () => close(false);
-                overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) close(false); });
+                if (deferBtn) deferBtn.onclick = () => { console.log('ZOE AutoMsg: confirmação CLIQUE ADIAR'); close('defer'); };
+                overlay.querySelector('#zoe-amsg-confirm-x').onclick = () => { console.log('ZOE AutoMsg: confirmação CLIQUE X'); close(false); };
+                overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) { console.log('ZOE AutoMsg: confirmação CLIQUE FORA DO MODAL'); close(false); } });
                 if (isChat) {
                     const openReasonModal = (cbEl) => new Promise(resolveR => {
                         const nameSpan = cbEl.closest('label').querySelector('.zoe-chat-name');
@@ -4950,8 +5476,10 @@ logTiming('Imagem gerada');
                         cb.addEventListener('change', async () => {
                             const uid = cb.value;
                             const nameSpan = overlay.querySelector('.zoe-chat-name[data-uid="' + uid + '"]');
+                            console.log('ZOE AutoMsg: confirmação CHECKBOX | uid=' + uid + ' | checked=' + cb.checked + ' | nome=' + (nameSpan ? nameSpan.textContent : '?'));
                             if (!cb.checked) {
                                 const reason = await openReasonModal(cb);
+                                console.log('ZOE AutoMsg: confirmação motivo exclusão | uid=' + uid + ' | reason=' + JSON.stringify(reason));
                                 if (reason) {
                                     saveChatExclusion(sport, uid, reason);
                                     if (nameSpan) {
@@ -4965,6 +5493,7 @@ logTiming('Imagem gerada');
                                 }
                             } else {
                                 removeChatExclusion(sport, uid);
+                                console.log('ZOE AutoMsg: confirmação exclusão removida | uid=' + uid + ' | exclusions=' + JSON.stringify(getChatExclusions(sport)));
                                 if (nameSpan) {
                                     delete nameSpan.dataset.reason;
                                     nameSpan.style.color = '';
@@ -4977,8 +5506,9 @@ logTiming('Imagem gerada');
                 }
             };
             if (doc.visibilityState === 'hidden') {
-                console.log('ZOE AutoMsg: tab não ativa, a aguardar ficar visível para mostrar confirmação');
+                console.log('ZOE AutoMsg: confirmação tab não ativa (hidden), a aguardar ficar visível | missing=' + missing.length);
                 const onVis = () => {
+                    console.log('ZOE AutoMsg: confirmação visibilitychange | state=' + doc.visibilityState);
                     if (doc.visibilityState === 'visible') {
                         doc.removeEventListener('visibilitychange', onVis);
                         showModal();
@@ -4986,6 +5516,7 @@ logTiming('Imagem gerada');
                 };
                 doc.addEventListener('visibilitychange', onVis);
             } else {
+                console.log('ZOE AutoMsg: confirmação tab visível, a abrir modal | missing=' + missing.length);
                 showModal();
             }
         });
@@ -5466,48 +5997,62 @@ logTiming('Imagem gerada');
     }
 
     async function executeChatSend(sport, pageInfo, eloRows, ourId) {
+        const t0 = Date.now();
+        const runId = 'chat-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+        const log = (msg) => console.log('ZOE Chat[' + runId + ']: ' + msg);
+        const warn = (msg) => console.warn('ZOE Chat[' + runId + ']: ' + msg);
         const settings = getClashSettings(sport);
+        log('START | sport=' + sport + ' | pageInfo=' + JSON.stringify(pageInfo || null) + ' | ourId=' + ourId + ' | chatToManagers=' + !!settings.chatToManagers + ' | templateLen=' + String(settings.chatTemplate || '').length + ' | inFlight=' + !!window.__zoeChatSendInFlight + ' | visibility=' + document.visibilityState);
         if (!settings.chatToManagers || !(settings.chatTemplate && settings.chatTemplate.trim())) {
-            console.log('ZOE Chat: desativado (checkbox ou template vazio)');
-            return;
+            log('desativado (checkbox ou template vazio)');
+            return { status: 'disabled' };
         }
         if (window.__zoeChatSendInFlight) {
-            console.log('ZOE Chat: envio já em curso noutro processo, a ignorar para evitar duplicados/ordem trocada');
-            return;
+            log('envio já em curso noutro processo, a ignorar para evitar duplicados/ordem trocada');
+            return { status: 'in-flight' };
         }
         window.__zoeChatSendInFlight = true;
         try {
+            const tr = Date.now();
             const nextRound = await fetchNextRoundData(sport);
+            log('fetchNextRoundData em ' + (Date.now() - tr) + 'ms → ' + (nextRound ? JSON.stringify({ round: nextRound.round, ts: nextRound.ts, season: nextRound.season, division: nextRound.division, rivalId: nextRound.rivalId, rivalName: nextRound.rivalName }) : 'null'));
             const round = pageInfo && pageInfo.round ? parseInt(pageInfo.round, 10) : (nextRound ? nextRound.round : null);
-            if (!round) { console.log('ZOE Chat: sem jornada, abortar envio'); return; }
+            if (!round) { warn('sem jornada, abortar envio'); return { status: 'no-round' }; }
             const sent = getChatSentState(sport);
+            log('round=' + round + ' | sentState=' + JSON.stringify(sent) + ' | alreadySentUids=' + JSON.stringify(getChatSentManagers(sport, round)));
             if (sent && sent.round === round) {
-                console.log('ZOE Chat: mensagens já enviadas nesta jornada #' + round + ', sem novo envio');
-                return;
+                log('mensagens já enviadas nesta jornada #' + round + ', sem novo envio');
+                return { status: 'already-sent', round: round };
             }
+            const tm = Date.now();
             const members = await fetchChatTargetManagers(sport, nextRound);
+            log('fetchChatTargetManagers em ' + (Date.now() - tm) + 'ms → ' + (members ? members.length : 0) + ' managers' + (members && members.length ? ' | ' + JSON.stringify(members.slice(0, 20).map(m => ({ uid: m.uid, name: m.name, team: m.team, isMain: !!m.isMain }))) : ''));
             if (!members || !members.length) {
-                console.log('ZOE Chat: sem managers detetados, sem envio');
-                return;
+                warn('sem managers detetados, sem envio');
+                return { status: 'no-members' };
             }
             const alreadySentUids = getChatSentManagers(sport, round);
             let targets = members.filter(m => alreadySentUids.indexOf(m.uid) < 0);
+            log('targets após alreadySent=' + targets.length + ' | ' + JSON.stringify(targets.map(m => m.name + '#' + m.uid)));
             if (!targets.length) {
-                console.log('ZOE Chat: todos os managers já receberam a mensagem nesta jornada');
-                return;
+                log('todos os managers já receberam a mensagem nesta jornada');
+                return { status: 'all-sent', round: round };
             }
+            const tc = Date.now();
             const decision = await confirmAutoMessageSend(sport, targets, false, true);
+            log('confirmAutoMessageSend em ' + (Date.now() - tc) + 'ms → ' + JSON.stringify(decision));
             if (decision === 'defer' || decision === 'cancel' || !decision) {
-                console.log('ZOE Chat: envio cancelado pelo utilizador');
-                return;
+                log('envio cancelado pelo utilizador');
+                return { status: 'cancelled' };
             }
             const confirmUids = Array.isArray(decision) ? decision : null;
             if (confirmUids) {
                 const sel = new Set(confirmUids);
                 targets = targets.filter(m => sel.has(m.uid));
+                log('targets após confirmação=' + targets.length + ' | ' + JSON.stringify(targets.map(m => m.name + '#' + m.uid)));
                 if (!targets.length) {
-                    console.log('ZOE Chat: nenhum manager selecionado na confirmação, sem envio');
-                    return;
+                    log('nenhum manager selecionado na confirmação, sem envio');
+                    return { status: 'none-selected', round: round };
                 }
             }
             const managerNames = targets.map(m => m.name).join('\n');
@@ -5516,22 +6061,30 @@ logTiming('Imagem gerada');
             const totalToSend = targets.length;
             let sentOk = 0, failed = 0;
             const successNames = [], failNames = [];
-            for (const m of targets) {
+            log('INÍCIO ENVIO | total=' + totalToSend + ' | managerNamesLen=' + managerNames.length + ' | whitelist=' + whitelistUids.size);
+            for (let idx = 0; idx < targets.length; idx++) {
+                const m = targets[idx];
+                const mt = Date.now();
+                log('manager ' + (idx + 1) + '/' + totalToSend + ' START | ' + m.name + '#' + m.uid + ' | isMain=' + !!m.isMain + ' | team=' + (m.team || ''));
                 if (chatStatusEl) chatStatusEl.textContent = t('chatSendingProgress') + ' ' + (sentOk + failed + 1) + t('chatSendingOf') + totalToSend + t('chatSendingTo') + m.name + '...';
                 if (!whitelistUids.has(m.uid)) {
-                    console.warn('ZOE Chat: ' + m.name + ' não está na lista de membros da federação, a saltar');
+                    warn('manager ' + (idx + 1) + ' | ' + m.name + ' não está na lista de membros da federação, a saltar');
                     failed++; failNames.push(m.name);
                     continue;
                 }
                 if (getChatSentManagers(sport, round).indexOf(m.uid) >= 0) {
-                    console.log('ZOE Chat: ' + m.name + ' já recebeu mensagem noutro separador, a saltar');
+                    log('manager ' + (idx + 1) + ' | ' + m.name + ' já recebeu mensagem noutro separador, a saltar');
                     continue;
                 }
                 const row = (eloRows || []).find(r => r.user === m.name);
+                log('manager ' + (idx + 1) + ' | rowMatch=' + (row ? 'sim' : 'não') + ' | eloRows=' + ((eloRows || []).length));
                 const msg = buildChatMessage(settings.chatTemplate, pageInfo, row, m.name, managerNames);
-                if (!msg || !msg.trim()) { console.warn('ZOE Chat: mensagem vazia para ' + m.name); failed++; failNames.push(m.name); continue; }
-                const ok = await sendPrivateMessage(sport, m.name, m.uid, msg);
-                if (ok) { sentOk++; successNames.push(m.name); markChatManagerSent(sport, round, m.uid); } else { failed++; failNames.push(m.name); }
+                log('manager ' + (idx + 1) + ' | mensagem len=' + String(msg || '').length + ' | linhas=' + String(msg || '').split(/\r?\n/).filter(l => l.trim()).length + ' | primeira="' + String(msg || '').split(/\r?\n/)[0].slice(0, 100) + '"');
+                if (!msg || !msg.trim()) { warn('manager ' + (idx + 1) + ' | mensagem vazia para ' + m.name); failed++; failNames.push(m.name); continue; }
+                const ok = await sendPrivateMessage(sport, m.name, m.uid, msg, { runId: runId, index: idx + 1, total: totalToSend });
+                log('manager ' + (idx + 1) + ' FIM | ' + m.name + ' | ok=' + ok + ' | duração=' + (Date.now() - mt) + 'ms');
+                if (ok) { sentOk++; successNames.push(m.name); markChatManagerSent(sport, round, m.uid); log('manager ' + (idx + 1) + ' | markChatManagerSent(' + m.uid + ') → ' + JSON.stringify(getChatSentManagers(sport, round))); }
+                else { failed++; failNames.push(m.name); }
                 if (chatStatusEl) {
                     let txt = 'Enviadas ' + sentOk + '/' + totalToSend + ' mensagens';
                     if (failed > 0) txt += ' (' + failed + ' falharam)';
@@ -5539,18 +6092,133 @@ logTiming('Imagem gerada');
                 }
                 await new Promise(r => setTimeout(r, 1500));
             }
-            console.log('ZOE Chat: concluído — enviadas = ' + sentOk + ', falhadas = ' + failed);
+            log('FIM ENVIO | enviadas=' + sentOk + ' | falhadas=' + failed + ' | success=' + JSON.stringify(successNames) + ' | fail=' + JSON.stringify(failNames) + ' | total=' + (Date.now() - t0) + 'ms');
             showAutoMessageResult(sport, sentOk, failed, successNames, failNames);
             if (failed === 0 && sentOk > 0) {
                 saveChatSentState(sport, round);
+                log('saveChatSentState(' + round + ') guardado');
             } else {
-                console.log('ZOE Chat: houve falhas, jornada fica por marcar para poder retentar os que faltam');
+                log('houve falhas, jornada fica por marcar para poder retentar os que faltam');
             }
+            return { status: 'done', round: round, total: totalToSend, sent: sentOk, failed: failed, successNames: successNames, failedNames: failNames };
         } catch(e) {
-            console.error('ZOE Chat: erro ao enviar:', e.message);
+            console.error('ZOE Chat[' + runId + ']: ERRO FATAL: ' + (e && e.stack ? e.stack : e));
+            return { status: 'error', message: e && e.message ? e.message : String(e) };
         } finally {
             window.__zoeChatSendInFlight = false;
+            log('finally | inFlight=false | duração total=' + (Date.now() - t0) + 'ms');
         }
+    }
+
+    function showChatTestNotice(message) {
+        const overlay = document.createElement('div');
+        overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;z-index:10000006;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center';
+        const modal = document.createElement('div');
+        modal.style.cssText = 'background:#1a1a2e;border:2px solid #f44336;border-radius:10px;padding:16px 10px;font-family:Arial,sans-serif;color:#eee;font-size:13px;width:85%;max-width:420px;box-shadow:0 4px 24px rgba(0,0,0,0.7)';
+        modal.innerHTML = '<div style="text-align:center;margin-bottom:12px"><b style="font-size:14px;color:#f44336">Teste de Chat</b></div><div style="font-size:12px;color:#ddd;line-height:1.5">' + String(message || '') + '</div><div style="display:flex;justify-content:flex-end;margin-top:12px"><button id="zoe-chat-test-notice-ok" style="background:#f44336;color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px">OK</button></div>';
+        overlay.appendChild(modal);
+        document.body.appendChild(overlay);
+        const close = () => overlay.remove();
+        modal.querySelector('#zoe-chat-test-notice-ok').onclick = close;
+        overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) close(); });
+    }
+
+    function runSingleChatTest() {
+        if (window.__zoeChatTestInFlight) {
+            showChatTestNotice('Já está um teste de chat em curso.');
+            return;
+        }
+        if (window.__zoeChatSendInFlight || window.__zoeAutoMsgSendInFlight || startClashScreenshotFlow._running) {
+            showChatTestNotice('Já existe um processo em curso (imagem, auto-mensagem ou chat). Tenta novamente quando terminar.');
+            return;
+        }
+        window.__zoeChatTestInFlight = true;
+        const doc = document;
+        const sport = detectCurrentSport();
+        const target = getChatTestTarget();
+        const targetUid = target.uid;
+        const targetName = target.name;
+        const targetInfo = targetName + ' (uid ' + targetUid + ')';
+        const message = 'Teste Chat';
+        const runId = 'chat-test-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+        const startedAt = Date.now();
+        const startSeq = zoeLogSeq;
+        const accent = getSportAccent(sport);
+        const overlay = doc.createElement('div');
+        overlay.id = 'zoe-chat-test-overlay';
+        overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;z-index:10000006;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center';
+        const modal = doc.createElement('div');
+        modal.style.cssText = 'background:#1a1a2e;border:2px solid ' + accent + ';border-radius:10px;padding:16px 10px;font-family:Arial,sans-serif;color:#eee;font-size:13px;width:85%;max-width:440px;max-height:80vh;overflow-y:auto;box-shadow:0 4px 24px rgba(0,0,0,0.7)';
+        modal.innerHTML = '<div style="display:flex;align-items:center;margin-bottom:12px;position:relative"><b id="zoe-chat-test-title" style="font-size:14px;color:' + accent + ';width:100%;text-align:center">Teste de Chat</b><span id="zoe-chat-sendtest-x" style="cursor:pointer;font-size:16px;color:#999;position:absolute;right:0;top:0">&times;</span></div>';
+        modal.innerHTML += '<div id="zoe-chat-sendtest-body" style="font-size:12px;color:#ddd;line-height:1.5">A enviar <b>"Teste Chat"</b> para <b>' + targetName + '</b> (uid ' + targetUid + ')...</div>';
+        modal.innerHTML += '<div id="zoe-chat-test-log" style="font-size:11px;color:#888;margin-top:8px"></div>';
+        modal.innerHTML += '<div id="zoe-chat-test-actions" style="display:none;justify-content:flex-end;align-items:center;margin-top:12px"><button id="zoe-chat-test-ok" style="background:' + accent + ';color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px">OK</button></div>';
+        overlay.appendChild(modal);
+        doc.body.appendChild(overlay);
+        const close = () => overlay.remove();
+        modal.querySelector('#zoe-chat-sendtest-x').onclick = close;
+        overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) close(); });
+        const body = modal.querySelector('#zoe-chat-sendtest-body');
+        const logEl = modal.querySelector('#zoe-chat-test-log');
+        const actions = modal.querySelector('#zoe-chat-test-actions');
+        const okBtn = modal.querySelector('#zoe-chat-test-ok');
+        okBtn.onclick = close;
+        const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        (async () => {
+            let ok = false;
+            let error = null;
+            try {
+                console.log('ZOE Chat Test[' + runId + ']: START | currentUser=' + (detectCurrentUser() || '?') + ' | target=' + targetName + '#' + targetUid + ' | url=https://www.managerzone.com/?p=profile&uid=' + targetUid + ' | message="' + message + '"');
+                ok = await sendPrivateMessage(sport, targetName, targetUid, message, { runId: runId, index: 1, total: 1 });
+                console.log('ZOE Chat Test[' + runId + ']: FIM | ok=' + ok + ' | duração=' + (Date.now() - startedAt) + 'ms');
+            } catch(e) {
+                error = e && e.stack ? e.stack : (e && e.message ? e.message : String(e));
+                console.error('ZOE Chat Test[' + runId + ']: ERRO: ' + error);
+            } finally {
+                window.__zoeChatTestInFlight = false;
+            }
+            const color = ok ? '#4caf50' : '#f44336';
+            body.innerHTML = ok
+                ? '<div style="color:#4caf50;font-weight:bold;margin-bottom:6px">Mensagem enviada com sucesso.</div><div style="color:#bbb">Destino: ' + targetInfo + '<br>Mensagem: "Teste Chat"</div>'
+                : '<div style="color:#f44336;font-weight:bold;margin-bottom:6px">Falha ao enviar a mensagem.</div><div style="color:#bbb">Destino: ' + targetInfo + '<br>Mensagem: "Teste Chat"</div>' + (error ? '<div style="color:#f44336;font-size:11px;margin-top:8px;white-space:pre-wrap">' + esc(error.slice(0, 800)) + '</div>' : '');
+            modal.style.borderColor = color;
+            const titleEl = modal.querySelector('#zoe-chat-test-title');
+            if (titleEl) titleEl.style.color = color;
+            actions.style.display = 'flex';
+            try {
+                const pageInfo = (typeof extractClashPageInfo === 'function' ? extractClashPageInfo() : null) || null;
+                const payload = {
+                    version: SCRIPT_VERSION,
+                    timestamp: new Date().toISOString(),
+                    username: detectCurrentUser() || '',
+                    sport: sport,
+                    ourId: (typeof getOurFedId === 'function' ? getOurFedId() : null),
+                    rivalId: null,
+                    autoRun: false,
+                    pageInfo: pageInfo,
+                    language: getLanguage(),
+                    test: true,
+                    image: { generated: false, plain: false, stats: false, urlPlain: null, urlStats: null },
+                    guestbookPosted: null,
+                    chat: { status: ok ? 'done' : 'error', test: true, targetUid: targetUid, targetName: targetName, message: message, sent: ok ? 1 : 0, failed: ok ? 0 : 1 },
+                    error: ok ? null : (error || 'Falha no teste de chat'),
+                    timings: { testChat: Date.now() - startedAt },
+                    userAgent: navigator.userAgent,
+                    pageUrl: location.href,
+                    entries: zoeLogBuffer.filter(entry => entry.seq > startSeq)
+                };
+                logEl.textContent = 'A enviar log para o Sheets...';
+                void sendClashDiagnosticLog(payload).then(sent => {
+                    logEl.textContent = sent ? 'Log enviado para o Sheets.' : 'O envio do log para o Sheets falhou.';
+                    logEl.style.color = sent ? '#4caf50' : '#f44336';
+                    console.log('ZOE Chat Test[' + runId + ']: log remoto ' + (sent ? 'enviado' : 'NÃO enviado'));
+                });
+            } catch(e) {
+                logEl.textContent = 'Erro ao preparar o log: ' + (e && e.message ? e.message : e);
+                logEl.style.color = '#f44336';
+                console.warn('ZOE Chat Test[' + runId + ']: erro ao preparar log remoto: ' + (e && e.message ? e.message : e));
+            }
+        })();
     }
 
     // --- Init ---
