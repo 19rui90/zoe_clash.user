@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ZOE - Clash Screenshot
 // @namespace    https://www.managerzone.com/
-// @version      1.2.6.7
+// @version      1.2.6.8
 // @description  Gera imagens do Clash Matcher com upload e guestbook
 // @author       ruisimoes
 // @license      MIT
@@ -117,7 +117,7 @@
             chatToManagers: 'Chat para Managers',
             chatTemplate: 'Template do Chat',
             sendDiagnosticLogs: 'Enviar logs de diagnóstico',
-            sendDiagnosticLogsTooltip: 'Envia um registo técnico ao autor sempre que uma imagem é gerada com sucesso (sem emails nem passwords).',
+            sendDiagnosticLogsTooltip: 'Envia registos técnicos automáticos quando o fluxo gera uma imagem (sem emails nem passwords). Cliques manuais, testes de chat e tentativas de Auto-Mensagem são sempre registados.',
             save: 'Guardar',
             cancel: 'Cancelar',
             soccer: 'Futebol',
@@ -320,7 +320,7 @@
             chatToManagers: 'Chat to Managers',
             chatTemplate: 'Chat Template',
             sendDiagnosticLogs: 'Send diagnostic logs',
-            sendDiagnosticLogsTooltip: 'Sends a technical report to the author whenever an image is generated successfully (no emails or passwords).',
+            sendDiagnosticLogsTooltip: 'Sends automatic technical reports when the flow generates an image (no emails or passwords). Manual clicks, chat tests and Auto-Message attempts are always logged.',
             language: 'Language',
             save: 'Save',
             cancel: 'Cancel',
@@ -524,7 +524,7 @@
             chatToManagers: 'Chat a Managers',
             chatTemplate: 'Template de Chat',
             sendDiagnosticLogs: 'Enviar registros de diagnóstico',
-            sendDiagnosticLogsTooltip: 'Envía un registro técnico al autor siempre que se genera una imagen correctamente (sin correos ni contraseñas).',
+            sendDiagnosticLogsTooltip: 'Envía registros técnicos automáticos cuando el flujo genera una imagen (sin correos ni contraseñas). Los clics manuales, las pruebas de chat y los intentos de Auto-Mensaje siempre se registran.',
             language: 'Idioma',
             save: 'Guardar',
             cancel: 'Cancelar',
@@ -2553,8 +2553,10 @@
         let flowChatResult = { status: 'not-attempted' };
         let flowLogContext = null;
         let flowError = null;
+        let flowOutcome = 'started';
         const flowTimings = {};
         const flowLogStartSeq = zoeLogSeq;
+        const flowStartedAt = Date.now();
         setPageLock(true);
         try {
         const t0 = performance.now();
@@ -2578,14 +2580,15 @@
         console.log('ZOE DEBUG startFlow: URL =', window.location.href);
         console.log('ZOE DEBUG startFlow: stored IDs =', JSON.stringify(getFedIdStorage()));
         const sport = detectCurrentSport();
+        flowLogContext = { sport: sport, ourId: null, rivalId: null, autoRun: !!autoRun, pageInfo: null, trigger: autoRun ? 'auto' : 'manual' };
         const clashCfg = getClashSettings(sport);
         if (!autoRun) {
             if (!clashCfg.guestbookTemplate || !clashCfg.guestbookTemplate.trim()) {
                 const confirmed = await showConfirmDialog('Atenção: Campo de "Mensagem" vazio. Nenhuma mensagem será publicada no painel de mensagens.<br><br>Deseja continuar mesmo assim?');
-                if (!confirmed) return;
+                if (!confirmed) { flowOutcome = 'cancelled-empty-guestbook'; return; }
             } else if (!/\*image\*/.test(clashCfg.guestbookTemplate) && !/\*image_stats\*/.test(clashCfg.guestbookTemplate)) {
                 const confirmed = await showConfirmDialog('Atenção: Campo de "Mensagem" sem o código <b>*image*</b> ou <b>*image_stats*</b>. Nenhuma imagem será enviada para o painel de mensagens.<br><br>Deseja continuar mesmo assim?');
-                if (!confirmed) return;
+                if (!confirmed) { flowOutcome = 'cancelled-no-image-placeholder'; return; }
             }
         }
         const webAppUrl = getGoogleAppsScriptUrl();
@@ -2593,7 +2596,10 @@
         let ourId = await fetchOurFedId();
         logTiming('fetchOurFedId');
         console.log('ZOE Clash: ourId =', ourId);
+        if (flowLogContext) flowLogContext.ourId = ourId || null;
         if (!ourId) {
+            flowOutcome = 'error-no-federation';
+            flowError = 'Nenhuma federação encontrada';
             const storedIds = getFedIdStorage();
             const info = '<br><br><span style="font-size:11px;color:#aaa">IDs guardados — Futebol: <b style="color:#e94560">' + (storedIds.soccer || 'nenhum') + '</b> | Hoquei: <b style="color:#e94560">' + (storedIds.hockey || 'nenhum') + '</b></span>';
             if (statusEl) statusEl.innerHTML = '<span style="color:#f44336;font-weight:bold">Erro: Nenhuma federação encontrada. Contactar o user @ruisimoes</span>' + info;
@@ -2614,6 +2620,7 @@
             const existingRound = await checkExistingClashPost(sport, ourId, scheduleData);
             logTiming('checkExistingClashPost');
             if (existingRound) {
+                flowOutcome = 'skipped-existing-round';
                 if (statusEl) statusEl.innerHTML = '<span style="color:#ff9800">' + t('errorRoundAlreadyGenerated') + ' ' + existingRound + ' ' + t('errorRoundAlreadyGeneratedSuffix') + '</span>';
                 console.log('ZOE Clash: jornada #' + existingRound + ' ja postada');
                 if (autoRun) await scheduleAutoRun(sport, existingRound);
@@ -2665,6 +2672,8 @@
             if (statusEl) statusEl.textContent = t('checkingPermissions');
             const currentUser2 = detectCurrentUser();
             if (!currentUser2) {
+                flowOutcome = 'error-no-username';
+                flowError = 'Username não detetado';
                 if (statusEl) statusEl.innerHTML = '<span style="color:#f44336;font-weight:bold">' + t('errorNoUsername') + '</span>';
                 return;
             }
@@ -2682,6 +2691,7 @@
         }
         let rivalId = scheduleData && scheduleData.rivalId ? scheduleData.rivalId : null;
         let rivalName = scheduleData && scheduleData.rivalName ? scheduleData.rivalName : '';
+        if (flowLogContext) flowLogContext.rivalId = rivalId || null;
         if (!rivalId && ourId) {
             if (statusEl) statusEl.textContent = t('detectingRival');
             console.log('ZOE Clash: sem rivalId do calendário, a buscar rival específico da jornada #' + (scheduleData ? scheduleData.round : '?'));
@@ -2806,7 +2816,10 @@
         }
 
         console.log('ZOE Clash: rivalId =', rivalId, '| rivalName =', rivalName);
+        if (flowLogContext) flowLogContext.rivalId = rivalId || null;
         if (!rivalId) {
+            flowOutcome = 'error-no-rival';
+            flowError = 'Rival não detetado';
             if (statusEl) statusEl.innerHTML = '<span style="color:#f44336;font-weight:bold">' + t('errorNoFederation') + '</span>';
             return;
         }
@@ -2841,11 +2854,15 @@
                 });
             });
         } catch(e) {
+            flowOutcome = 'error-api';
+            flowError = e.message;
             console.error('ZOE Clash: erro ao buscar dados:', e.message);
             if (statusEl) statusEl.innerHTML = '<span style="color:#f44336">Erro: ' + e.message + '</span>';
             return;
         }
         if (!tableHtml || tableHtml.trim().length === 0) {
+            flowOutcome = 'error-empty-api';
+            flowError = 'Resposta vazia do statsxente';
             console.error('ZOE Clash: resposta vazia da API');
             if (statusEl) statusEl.innerHTML = '<span style="color:#f44336">Resposta vazia do statsxente.</span>';
             return;
@@ -2885,16 +2902,22 @@
                         logTiming('fallbackDadosAPI');
                         // continuar para a geração de imagem/upload/publicação abaixo (sem return)
                     } else {
+                        flowOutcome = 'error-no-games';
+                        flowError = 'Fallback API sem jogos';
                         console.log('ZOE Clash: fallback match mas a API continua sem jogos — manter erro');
                         if (statusEl) statusEl.innerHTML = '<span style="color:#f44336">' + t('noGamesFound') + '</span>' + info;
                         return;
                     }
                 } catch(e) {
+                    flowOutcome = 'error-api-fallback';
+                    flowError = e.message;
                     console.error('ZOE Clash: erro no fallback API:', e.message);
                     if (statusEl) statusEl.innerHTML = '<span style="color:#f44336">' + t('noGamesFound') + '</span>' + info;
                     return;
                 }
             } else {
+                flowOutcome = 'error-no-games';
+                flowError = 'Sem jogos (sem match no fallback)';
                 console.log('ZOE Clash: fallback — sem match entre prev=1 e atual — manter erro');
                 if (statusEl) statusEl.innerHTML = '<span style="color:#f44336">' + t('noGamesFound') + '</span>' + info;
                 return;
@@ -3053,13 +3076,14 @@
                 logTiming('screenshotStats');
             }
             if (statusEl) statusEl.textContent = t('imageGenerated');
-            flowLogContext = { sport: sport, ourId: ourId, rivalId: rivalId, autoRun: !!autoRun, pageInfo: null };
+            flowLogContext = { sport: sport, ourId: ourId, rivalId: rivalId, autoRun: !!autoRun, pageInfo: null, trigger: autoRun ? 'auto' : 'manual' };
             const clashSettings2 = getClashSettings(sport);
             let pageInfo = null;
             if (clashSettings2.guestbookTemplate && clashSettings2.guestbookTemplate.trim()) {
                 if (clashSettings2.askBeforePost && !autoRun) {
                     const confirmed = await showConfirmDialog(t('confirmSendToBoard'), true);
                     if (!confirmed) {
+                        flowOutcome = 'cancelled-guestbook';
                         console.log('ZOE Clash: utilizador cancelou envio para guestbook');
                         return;
                     }
@@ -3095,7 +3119,9 @@
                 await scheduleAutoRun(sport, usedRound);
                 logTiming('total');
             }
+            flowOutcome = 'completed';
         } catch(e) {
+            flowOutcome = 'error';
             flowError = e.message;
             console.error('ZOE Clash: erro ao gerar/upload imagem:', e.message);
             if (statusEl) statusEl.innerHTML = '<span style="color:#f44336">Erro imagem: ' + e.message + '</span>';
@@ -3108,7 +3134,12 @@
         startClashScreenshotFlow._running = false;
         startClashScreenshotFlow._cooldownUntil = Date.now() + 3000;
         try {
-            if (flowImageGenerated && flowLogContext && getClashSettings(flowLogContext.sport).sendDiagnosticLogs) {
+            if (!flowLogContext) {
+                flowLogContext = { sport: detectCurrentSport(), ourId: null, rivalId: null, autoRun: !!autoRun, pageInfo: null, trigger: autoRun ? 'auto' : 'manual' };
+            }
+            const shouldLogFlow = flowLogContext.trigger === 'manual' ||
+                (flowImageGenerated && getClashSettings(flowLogContext.sport).sendDiagnosticLogs);
+            if (shouldLogFlow) {
                 const entries = zoeLogBuffer.filter(entry => entry.seq > flowLogStartSeq);
                 void sendClashDiagnosticLog({
                     version: SCRIPT_VERSION,
@@ -3118,6 +3149,8 @@
                     ourId: flowLogContext.ourId,
                     rivalId: flowLogContext.rivalId,
                     autoRun: flowLogContext.autoRun,
+                    trigger: flowLogContext.trigger || (autoRun ? 'auto' : 'manual'),
+                    outcome: flowOutcome,
                     pageInfo: flowLogContext.pageInfo,
                     language: getLanguage(),
                     image: {
@@ -3130,6 +3163,7 @@
                     guestbookPosted: flowGuestbookPosted,
                     chat: flowChatResult,
                     error: flowError,
+                    durationMs: Date.now() - flowStartedAt,
                     timings: flowTimings,
                     userAgent: navigator.userAgent,
                     pageUrl: location.href,
@@ -5782,6 +5816,19 @@ logTiming('Imagem gerada');
             return;
         }
         window.__zoeAutoMsgSendInFlight = true;
+        const autoMsgLogStartSeq = zoeLogSeq;
+        const autoMsgStartedAt = Date.now();
+        let autoMsgAttempted = false;
+        let autoMsgError = null;
+        let autoMsgRound = null;
+        let autoMsgPageInfo = null;
+        let autoMsgRivalId = null;
+        let autoMsgTotal = 0;
+        let autoMsgSentOk = 0;
+        let autoMsgFailed = 0;
+        let autoMsgSuccessNames = [];
+        let autoMsgFailNames = [];
+        let autoMsgPartial = false;
         const settings = getClashSettings(sport);
         if (!settings.autoMessage || !(settings.autoMessageTemplate && settings.autoMessageTemplate.trim())) {
             console.log('ZOE AutoMsg: desativado');
@@ -5791,6 +5838,7 @@ logTiming('Imagem gerada');
                 if (fromAuto) {
                         if (!acquireRunLock()) {
                 console.log('ZOE AutoMsg: outro separador está a enviar, a saltar');
+                window.__zoeAutoMsgSendInFlight = false;
                 return;
             }
             startRunLockHeartbeat();
@@ -5798,6 +5846,8 @@ logTiming('Imagem gerada');
         try {
             const nextRound = await fetchNextRoundData(sport);
             if (!nextRound) { console.log('ZOE AutoMsg: sem dados, abortar envio'); return; }
+            autoMsgRound = nextRound.round;
+            autoMsgRivalId = nextRound.rivalId || null;
             const sent = getAutoMsgSentState(sport);
             if (sent && sent.round === nextRound.round) {
                 console.log('ZOE AutoMsg: jornada #' + nextRound.round + ' já enviada, a reagendar...');
@@ -5835,6 +5885,7 @@ logTiming('Imagem gerada');
                 return;
             }
             const pageInfo = { round: String(round), season: nextRound.season || '', division: nextRound.division || '', rival: nextRound.rivalName || '' };
+            autoMsgPageInfo = pageInfo;
             const template = settings.autoMessageTemplate;
             const decision = await confirmAutoMessageSend(sport, missing, !!fromAuto);
             if (decision === 'defer') {
@@ -5869,6 +5920,7 @@ logTiming('Imagem gerada');
                 }
             }
             const partialSend = !!((selectedUids && selectedUids.length) || (confirmUids && confirmUids.length)) && missing.length !== allMissingUids.length;
+            autoMsgPartial = partialSend;
             const managerNames = missing.map(m => m.name).join('\n');
             const sentNow = getAutoMsgSentState(sport);
             if (sentNow && sentNow.round === round) {
@@ -5879,13 +5931,17 @@ logTiming('Imagem gerada');
             const whitelistUids = new Set(members.all.map(m => m.uid));
             const amsgStatusEl = ensureAutoMsgStatusEl(sport);
             const totalToSend = missing.length;
-            let sentOk = 0, failed = 0;
-            const successNames = [], failNames = [];
+            autoMsgAttempted = true;
+            autoMsgTotal = totalToSend;
+            autoMsgSentOk = 0;
+            autoMsgFailed = 0;
+            autoMsgSuccessNames = [];
+            autoMsgFailNames = [];
             for (const m of missing) {
-                if (amsgStatusEl) amsgStatusEl.textContent = t('automessageSending') + (sentOk + failed + 1) + '/' + totalToSend + t('automessageOf') + m.name + '...';
+                if (amsgStatusEl) amsgStatusEl.textContent = t('automessageSending') + (autoMsgSentOk + autoMsgFailed + 1) + '/' + totalToSend + t('automessageOf') + m.name + '...';
                 if (!whitelistUids.has(m.uid)) {
                     console.warn('ZOE AutoMsg: ' + m.name + ' não está na lista de membros da federação, a saltar');
-                    failed++; failNames.push(m.name);
+                    autoMsgFailed++; autoMsgFailNames.push(m.name);
                     continue;
                 }
                 const sentNow2 = getAutoMsgSentState(sport);
@@ -5898,30 +5954,74 @@ logTiming('Imagem gerada');
                     continue;
                 }
                 const msg = buildGuestbookMessage(template, pageInfo, null, '', [], false, null).replace(/\*managers\*/g, managerNames).replace(/\*name\*/g, m.name);
-                if (!msg || !msg.trim()) { console.warn('ZOE AutoMsg: mensagem vazia para ' + m.name); failed++; failNames.push(m.name); continue; }
+                if (!msg || !msg.trim()) { console.warn('ZOE AutoMsg: mensagem vazia para ' + m.name); autoMsgFailed++; autoMsgFailNames.push(m.name); continue; }
                 const ok = await sendPrivateMessage(sport, m.name, m.uid, msg);
-                if (ok) { sentOk++; successNames.push(m.name); markAutoMsgManagerSent(sport, round, m.uid); } else { failed++; failNames.push(m.name); }
+                if (ok) { autoMsgSentOk++; autoMsgSuccessNames.push(m.name); markAutoMsgManagerSent(sport, round, m.uid); } else { autoMsgFailed++; autoMsgFailNames.push(m.name); }
                 if (amsgStatusEl) {
-                    let txt = t('automessageSent') + sentOk + '/' + totalToSend + t('automessageSentCount');
-                    if (failed > 0) txt += t('automessageFailed') + failed + t('automessageFailedCount');
+                    let txt = t('automessageSent') + autoMsgSentOk + '/' + totalToSend + t('automessageSentCount');
+                    if (autoMsgFailed > 0) txt += t('automessageFailed') + autoMsgFailed + t('automessageFailedCount');
                     amsgStatusEl.textContent = txt;
                 }
                 await new Promise(r => setTimeout(r, 1500));
             }
-            console.log('ZOE AutoMsg: concluído — enviadas = ' + sentOk + ', falhadas = ' + failed);
-            showAutoMessageResult(sport, sentOk, failed, successNames, failNames);
-            if (failed === 0 && !partialSend) {
+            console.log('ZOE AutoMsg: concluído — enviadas = ' + autoMsgSentOk + ', falhadas = ' + autoMsgFailed);
+            showAutoMessageResult(sport, autoMsgSentOk, autoMsgFailed, autoMsgSuccessNames, autoMsgFailNames);
+            if (autoMsgFailed === 0 && !partialSend) {
                 saveAutoMsgSentState(sport, round);
             } else {
                 console.log('ZOE AutoMsg: houve falhas ou envio parcial, jornada fica por marcar para poder retentar os que faltam');
             }
             await scheduleAutoMessage(sport, round);
         } catch(e) {
-            console.error('ZOE AutoMsg: erro ao enviar:', e.message);
+            autoMsgError = e && e.message ? e.message : String(e);
+            console.error('ZOE AutoMsg: erro ao enviar:', autoMsgError);
             await scheduleAutoMessage(sport).catch(function(err) { console.log('ZOE AutoMsg: erro ao reagendar:', err); });
         } finally {
             window.__zoeAutoMsgSendInFlight = false;
             if (fromAuto) releaseRunLock();
+            if (autoMsgAttempted || autoMsgError) {
+                try {
+                    const autoMsgStatus = autoMsgError ? 'error' : ((autoMsgFailed > 0 || autoMsgPartial) ? 'partial' : 'done');
+                    const autoMsgEntries = zoeLogBuffer.filter(entry => entry.seq > autoMsgLogStartSeq);
+                    void sendClashDiagnosticLog({
+                        version: SCRIPT_VERSION,
+                        timestamp: new Date().toISOString(),
+                        username: detectCurrentUser() || '',
+                        sport: sport,
+                        ourId: (typeof getOurFedId === 'function' ? getOurFedId() : null),
+                        rivalId: autoMsgRivalId,
+                        autoRun: !!fromAuto,
+                        trigger: fromAuto ? 'auto' : 'manual',
+                        outcome: autoMsgStatus,
+                        pageInfo: autoMsgPageInfo,
+                        language: getLanguage(),
+                        image: { generated: false, plain: false, stats: false, urlPlain: null, urlStats: null },
+                        guestbookPosted: null,
+                        chat: { status: 'not-attempted' },
+                        autoMessage: {
+                            attempted: autoMsgAttempted,
+                            status: autoMsgStatus,
+                            round: autoMsgRound,
+                            total: autoMsgTotal,
+                            sent: autoMsgSentOk,
+                            failed: autoMsgFailed,
+                            successNames: autoMsgSuccessNames,
+                            failNames: autoMsgFailNames,
+                            partialSend: autoMsgPartial,
+                            fromAuto: !!fromAuto,
+                            selectedUids: (selectedUids && selectedUids.length) ? selectedUids : null,
+                            error: autoMsgError
+                        },
+                        error: autoMsgError,
+                        timings: { autoMessage: Date.now() - autoMsgStartedAt },
+                        userAgent: navigator.userAgent,
+                        pageUrl: location.href,
+                        entries: autoMsgEntries
+                    });
+                } catch(logErr) {
+                    console.warn('ZOE AutoMsg: erro ao preparar log remoto:', logErr && logErr.message ? logErr.message : logErr);
+                }
+            }
         }
     }
 
