@@ -959,6 +959,7 @@
         : 'desconhecida';
     const SCRIPT_ID = '588299';
     const UPDATE_CHECK_KEY = 'zoe_last_update_check';
+    const UPDATE_CHECK_VERSION_KEY = 'zoe_last_update_check_version';
     const UPDATE_SNOOZE_KEY = 'zoe_update_snooze_until';
     const UPDATE_SNOOZE_MS = 7 * 24 * 60 * 60 * 1000; // 1 semana
     const GITHUB_RAW_URL = 'https://raw.githubusercontent.com/19rui90/zoe_clash.user/main/zoe_clash.user.js'; // <-- URL raw do teu .user.js no GitHub
@@ -980,8 +981,9 @@
         try {
             if (location.hostname !== 'www.managerzone.com') return;
             const lastCheck = GM_getValue(UPDATE_CHECK_KEY, 0);
+            const lastCheckVersion = GM_getValue(UPDATE_CHECK_VERSION_KEY, '');
             const now = Date.now();
-            if (!manual && now - lastCheck < 10000) {
+            if (!manual && now - lastCheck < 10000 && lastCheckVersion === SCRIPT_VERSION) {
                 return;
             }
 
@@ -993,9 +995,12 @@
                 if (!GITHUB_RAW_URL) {
                     console.log('ZOE Update: GITHUB_RAW_URL não definido — a usar só a atualização nativa do Tampermonkey');
                 } else {
+                    const rawUrl = GITHUB_RAW_URL + (GITHUB_RAW_URL.indexOf('?') >= 0 ? '&' : '?') + '_zoe=' + Date.now();
+                    console.log('ZOE Update: a consultar raw (cache-buster) →', rawUrl);
                     const html = await new Promise((resolve, reject) => {
                         GM_xmlhttpRequest({
-                            method: 'GET', url: GITHUB_RAW_URL, timeout: 15000,
+                            method: 'GET', url: rawUrl, timeout: 15000,
+                            headers: { 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' },
                             onload: (r) => { if (r.status === 200 && r.responseText) resolve(r.responseText); else reject(new Error('status=' + r.status)); },
                             onerror: (e) => reject(e),
                             ontimeout: () => reject(new Error('Timeout'))
@@ -1016,10 +1021,12 @@
             if (!remoteVersion) {
                 console.log('ZOE Update: não foi possível verificar (a atualização nativa do Tampermonkey continua ativa via @updateURL)');
                 GM_setValue(UPDATE_CHECK_KEY, Date.now());
+                GM_setValue(UPDATE_CHECK_VERSION_KEY, SCRIPT_VERSION);
                 return;
             }
 
             GM_setValue(UPDATE_CHECK_KEY, Date.now());
+            GM_setValue(UPDATE_CHECK_VERSION_KEY, SCRIPT_VERSION);
 
             if (compareVersions(SCRIPT_VERSION, remoteVersion) < 0) {
                 const snoozeUntil = GM_getValue(UPDATE_SNOOZE_KEY, 0);
@@ -1302,9 +1309,13 @@
 
     if (location.hostname !== 'www.managerzone.com') return;
 
-    // Verificação de atualizações: em último plano, sem prioridade sobre as funções principais.
-    // Só no Managerzone; o check inicial ocorre após a página estar pronta (15s).
-    setTimeout(checkForUpdates, 15000);
+    // Verificação de atualizações: imediata no arranque e depois de hora a hora.
+    // Só no Managerzone; se o body ainda não existir, espera pelo DOMContentLoaded.
+    if (document.body) {
+        checkForUpdates();
+    } else {
+        document.addEventListener('DOMContentLoaded', function() { checkForUpdates(); }, { once: true });
+    }
     setInterval(checkForUpdates, 3600000);
 
     function detectCurrentSport() {
